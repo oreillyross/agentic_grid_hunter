@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+
+# Stage 3+ will write trace files here — keep the directory in git via .gitkeep
+# but don't track the traces themselves.
+runs/*
+!runs/.gitkeep

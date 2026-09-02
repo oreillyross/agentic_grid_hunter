@@ -21,6 +21,21 @@ agentic-grid-hunter/
 
 ---
 
+## Getting started (Stage 1 is built)
+
+```bash
+pnpm install
+cp .env.example .env   # then fill in ANTHROPIC_API_KEY
+pnpm start              # renders the grid, sends it to Claude, prints the reply
+pnpm typecheck           # tsc --noEmit
+```
+
+`src/cli.ts` and `src/grid.ts` are heavily commented — read them in that order
+(grid first, then cli) if you're using this repo to learn the mechanics
+rather than just running it.
+
+---
+
 ## Stage 1 — Bare Loop
 
 **Objective:** Prove the plumbing. One prompt in, one completion out, nothing agentic yet.
