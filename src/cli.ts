@@ -28,7 +28,14 @@ if (!process.env.ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
-const client = new Anthropic();
+// Identity-linked Anthropic API keys also require the workspace they should act
+// in. Regular API keys do not, so only send this header when configured.
+const workspaceId = process.env.ANTHROPIC_WORKSPACE_ID;
+const client = new Anthropic({
+  defaultHeaders: workspaceId
+    ? { "anthropic-workspace-id": workspaceId }
+    : undefined,
+});
 
 // Allow overriding the model via env var so you can experiment without
 // editing code, but default to a sane, current model.
