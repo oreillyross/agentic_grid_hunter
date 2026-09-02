@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    // Modern Node (v20+) target — we're not shipping this to browsers or old runtimes.
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Strict mode on, no exceptions — the whole point of this repo is to learn
+    // the mechanics correctly, and strict checks catch sloppy assumptions early.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+
+    // We run via tsx (transpile-only), so tsc here is only used for `pnpm typecheck`.
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"]
+}
