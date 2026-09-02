@@ -21,18 +21,21 @@ agentic-grid-hunter/
 
 ---
 
-## Getting started (Stage 1 is built)
+## Getting started (Stages 1–2 are built)
 
 ```bash
 pnpm install
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY
-pnpm start              # renders the grid, sends it to Claude, prints the reply
+pnpm start              # Stage 2: runs the agent loop, prints each tool call and outcome
 pnpm typecheck           # tsc --noEmit
 ```
 
-`src/cli.ts` and `src/grid.ts` are heavily commented — read them in that order
-(grid first, then cli) if you're using this repo to learn the mechanics
-rather than just running it.
+The source is heavily commented — read `src/grid.ts`, then `src/tools.ts`,
+then `src/agent.ts`, then `src/cli.ts`, in that order, if you're using this
+repo to learn the mechanics rather than just running it. That order follows
+the dependency chain: the environment, then the actions available in it,
+then the loop that ties actions to the model, then the entry point that
+kicks it off.
 
 ---
 

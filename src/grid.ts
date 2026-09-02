@@ -34,10 +34,14 @@ export interface GridState {
   player: Position;
   treasure: Position;
   trap: Position;
+  // Stage 2: the win condition is *picking up* the treasure via the
+  // `pickup` tool, not merely walking onto its cell (see tools.ts) — so the
+  // state needs to track whether that's happened yet.
+  treasureCollected: boolean;
 }
 
 /** Two positions are equal if their row AND col both match. */
-function samePosition(a: Position, b: Position): boolean {
+export function samePosition(a: Position, b: Position): boolean {
   return a.row === b.row && a.col === b.col;
 }
 
@@ -57,7 +61,7 @@ export function createGrid(): GridState {
   const treasure: Position = { row: 0, col: 4 }; // top-right corner
   const trap: Position = { row: 2, col: 2 }; // dead center
 
-  return { size, player, treasure, trap };
+  return { size, player, treasure, trap, treasureCollected: false };
 }
 
 /**
@@ -123,4 +127,88 @@ export function describePositions(state: GridState): string {
     `Treasure is at (row ${treasure.row}, col ${treasure.col}).`,
     `Trap is at (row ${trap.row}, col ${trap.col}).`,
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 additions below. Stage 1 only ever needed to *describe* a state.
+// Stage 2 needs to *change* it — the model picks a tool, we execute it
+// against this state, and the result gets fed back. Everything below is the
+// "rules of the world" half of that: what a move does, what's next to you.
+// The "what does the model actually do" half lives in tools.ts and agent.ts.
+// ---------------------------------------------------------------------------
+
+/** The four directions the `move` tool accepts. Walls are out of scope for
+ * Stage 2 (see README), so movement is unobstructed except by the grid's
+ * own edge. */
+export type Direction = "up" | "down" | "left" | "right";
+
+export const DIRECTION_OFFSETS: Record<Direction, { dRow: number; dCol: number }> = {
+  up: { dRow: -1, dCol: 0 },
+  down: { dRow: 1, dCol: 0 },
+  left: { dRow: 0, dCol: -1 },
+  right: { dRow: 0, dCol: 1 },
+};
+
+/** True if `pos` falls within the grid's bounds. */
+export function inBounds(state: GridState, pos: Position): boolean {
+  return (
+    pos.row >= 0 && pos.row < state.size && pos.col >= 0 && pos.col < state.size
+  );
+}
+
+/** What's at a given cell — used by `look()` to describe a neighboring cell
+ * without handing the model the raw `GridState` object (see the comment on
+ * `GridState` above for why that boundary matters). */
+export type CellContent = "player" | "treasure" | "trap" | "empty";
+
+export function cellAt(state: GridState, pos: Position): CellContent {
+  if (samePosition(pos, state.player)) return "player";
+  if (samePosition(pos, state.treasure)) return "treasure";
+  if (samePosition(pos, state.trap)) return "trap";
+  return "empty";
+}
+
+export interface MoveOutcome {
+  /** false if the move was blocked (only possible cause right now: the
+   * grid's edge — there are no walls yet). */
+  moved: boolean;
+  /** What the player is standing on *after* the move (or still standing on,
+   * if the move was blocked). Deliberately never "player" — that would be a
+   * category error, this describes the ground under them, not them. */
+  landedOn: Exclude<CellContent, "player">;
+}
+
+/**
+ * Moves `state.player` one cell in `direction`, if that stays in bounds.
+ *
+ * This mutates `state` in place rather than returning a new `GridState`.
+ * That's a deliberate simplification, not an oversight: the agent loop in
+ * agent.ts owns exactly one `GridState` for the whole run and nothing else
+ * touches it concurrently, so there's no shared-mutable-state hazard here
+ * to design around. A React app or a multiplayer server would need
+ * immutable updates; a single-threaded CLI loop doesn't.
+ */
+export function movePlayer(state: GridState, direction: Direction): MoveOutcome {
+  const { dRow, dCol } = DIRECTION_OFFSETS[direction];
+  const next: Position = { row: state.player.row + dRow, col: state.player.col + dCol };
+
+  if (!inBounds(state, next)) {
+    // Blocked by the edge: player doesn't move, so "what they're standing
+    // on" is unchanged and is by definition not the treasure or trap
+    // (those aren't co-located with the player already).
+    return { moved: false, landedOn: "empty" };
+  }
+
+  // Figure out what's on the destination cell *before* moving the player
+  // onto it — once `state.player` becomes `next`, samePosition(next,
+  // state.player) would trivially be true and we'd lose the ability to
+  // tell "empty" from "treasure" or "trap".
+  const landedOn: Exclude<CellContent, "player"> = samePosition(next, state.treasure)
+    ? "treasure"
+    : samePosition(next, state.trap)
+    ? "trap"
+    : "empty";
+
+  state.player = next;
+  return { moved: true, landedOn };
 }
