@@ -20,7 +20,12 @@ if (!process.env.ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 
-const client = new Anthropic();
+const client = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  defaultHeaders: {
+    'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID,
+  },
+});
 const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5";
 
 // The move-limit end condition from the README ("move limit reached, e.g.
