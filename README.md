@@ -21,14 +21,19 @@ agentic-grid-hunter/
 
 ---
 
-## Getting started (Stages 1–2 are built)
+## Getting started (Stages 1–3 are built)
 
 ```bash
 pnpm install
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY
-pnpm start              # Stage 2: runs the agent loop, prints each tool call and outcome
+pnpm start              # runs the agent loop: plan -> tool call -> result, per turn
+LAYOUT=hard pnpm start   # Stage 3's trap-in-the-way layout (see Stage 3 below)
 pnpm typecheck           # tsc --noEmit
 ```
+
+Every run also writes its full trace — plan text, action, tool result, and
+resulting state for each turn — to `runs/<timestamp>.json` (gitignored; see
+Stage 3 below).
 
 The source is heavily commented — read `src/grid.ts`, then `src/tools.ts`,
 then `src/agent.ts`, then `src/cli.ts`, in that order, if you're using this
@@ -77,20 +82,20 @@ kicks it off.
 
 ---
 
-## Stage 3 — Explicit Plan-Then-Act (ReAct-style)
+## Stage 3 — Explicit Plan-Then-Act (ReAct-style) — done
 
 **Objective:** Make the reasoning visible, not just the actions. This is what separates "agent" from "function-calling chatbot."
 
-**Tasks:**
-- Modify system prompt to require a `<plan>` block (or a `thinking`-style field) before each tool call — one or two sentences on why this move
-- Log plan + action + result together per step (to console and to a `runs/<timestamp>.json` trace file)
-- Try a harder layout (trap between player and treasure) and read the plans — does the agent's stated reasoning match what it actually does?
+**What's built:**
+- The system prompt (`agent.ts`) now requires a `<plan>...</plan>` block (one or two sentences) before each tool call. A response with a tool call but no plan text isn't rejected — the turn still runs (the API requires a `tool_result` for every `tool_use` regardless), but the trace records `"(no plan given this turn)"` and the model gets a reminder folded into that turn's `tool_result` so it course-corrects next turn.
+- Every turn is recorded as a `TraceStep` (`{ turn, plan, action, result, outcome, moveCount, gridAfter }`) — logged to the console as it happens, and the full run (plus `timestamp`, `model`, `layout`, `maxMoves`, final `outcome`/`moveCount`) is written to `runs/<timestamp>.json` by `cli.ts` once the run ends.
+- `grid.ts` gained a `"hard"` layout alongside Stage 2's default `"easy"` one: trap at `(4,2)`, directly between the player at `(4,0)` and the treasure at `(4,4)` on the shortest path, so a straight-line plan runs the agent right into it. Select it with `LAYOUT=hard pnpm start`.
 
 **Acceptance criteria:**
-- Every step in the trace has: plan text, action taken, tool result, resulting state
-- At least one run on a "trap in the way" layout where you can point to the plan text explaining the avoidance
+- Every step in the trace has: plan text, action taken, tool result, resulting state — see the `TraceStep` shape above and any `runs/*.json` file
+- At least one run on a "trap in the way" layout where you can point to the plan text explaining the avoidance — run `LAYOUT=hard pnpm start` and read the `<plan>` text in the console output / trace file against the trap's position
 
-**Explicitly out of scope:** the agent doesn't need to be *good* yet — the point is visibility, not performance.
+**Explicitly out of scope:** the agent doesn't need to be *good* yet — the point is visibility, not performance. (In practice, watching a `LAYOUT=hard` run is exactly the exercise the README calls for: read the plan text at each step and check whether it actually names the trap and a detour, or just narrates the move it was going to make anyway.)
 
 ---
 

@@ -1,16 +1,20 @@
-// cli.ts — Stage 2 entry point.
+// cli.ts — Stage 3 entry point.
 //
-// Stage 1's cli.ts made one call and printed the reply (see git history /
-// the Stage 1 PR for that version). Stage 2 wraps the same kind of call in
-// the loop from agent.ts: build a world, hand control to the loop, print
-// what happens as it plays out, report the final outcome. All the actual
-// "agent" mechanics (tool_use -> execute -> tool_result -> repeat) live in
-// agent.ts and tools.ts — read grid.ts, then tools.ts, then agent.ts, then
-// this file, in that order, if you're using this repo to learn.
+// Stage 2's cli.ts built a world and handed control to the loop, printing
+// what happened as it played out. Stage 3 adds one more responsibility:
+// once the run finishes, write its full plan+action+result trace to
+// `runs/<timestamp>.json` so it can be read back later instead of only
+// existing in scrollback. All the actual "agent" mechanics (plan -> tool_use
+// -> execute -> tool_result -> repeat) live in agent.ts and tools.ts — read
+// grid.ts, then tools.ts, then agent.ts, then this file, in that order, if
+// you're using this repo to learn.
 
 import "dotenv/config"; // loads .env into process.env — see .env.example
+import { mkdirSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
-import { createGrid, renderGrid, describePositions } from "./grid.js";
+import { createGrid, renderGrid, describePositions, type Layout } from "./grid.js";
 import { runAgentLoop } from "./agent.js";
 
 if (!process.env.ANTHROPIC_API_KEY) {
@@ -34,10 +38,20 @@ const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5";
 // step isn't punished for it.
 const MAX_MOVES = Number(process.env.MAX_MOVES ?? 20);
 
+// "easy" is Stage 2's original layout (trap off the direct path). "hard" is
+// Stage 3's addition: the trap sits directly between player and treasure,
+// so the plan text has to explain a detour — see grid.ts. Defaults to
+// "easy" to keep `pnpm start` matching Stage 2's behavior; run
+// `LAYOUT=hard pnpm start` for the Stage 3 acceptance-criteria layout.
+const LAYOUT: Layout = process.env.LAYOUT === "hard" ? "hard" : "easy";
+
+const RUNS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "runs");
+
 async function main() {
-  const state = createGrid();
+  const state = createGrid(LAYOUT);
 
   console.log("=== Starting grid ===");
+  console.log(`Layout: ${LAYOUT}`);
   console.log(renderGrid(state));
   console.log();
   console.log(describePositions(state));
@@ -45,11 +59,45 @@ async function main() {
   console.log(`=== Running agent loop (${MODEL}, max ${MAX_MOVES} moves) ===`);
   console.log();
 
+  const startedAt = new Date();
   const result = await runAgentLoop(client, MODEL, state, MAX_MOVES);
 
   console.log("=== Run complete ===");
   console.log(`Outcome: ${result.outcome}`);
   console.log(`Moves used: ${result.moveCount}/${MAX_MOVES}`);
+
+  const runFile = writeTrace(startedAt, result);
+  console.log(`Trace written to ${runFile}`);
+}
+
+/**
+ * Writes the run's plan+action+result trace to `runs/<timestamp>.json`.
+ * This is Stage 3's acceptance criteria made literal: every step in the
+ * trace carries plan text, the action taken, the tool result, and the
+ * resulting state, so a run can be reviewed later without having to have
+ * watched it live in the terminal.
+ */
+function writeTrace(
+  startedAt: Date,
+  result: Awaited<ReturnType<typeof runAgentLoop>>
+): string {
+  mkdirSync(RUNS_DIR, { recursive: true });
+
+  const timestamp = startedAt.toISOString().replace(/[:.]/g, "-");
+  const runFile = join(RUNS_DIR, `${timestamp}.json`);
+
+  const record = {
+    timestamp: startedAt.toISOString(),
+    model: MODEL,
+    layout: LAYOUT,
+    maxMoves: MAX_MOVES,
+    outcome: result.outcome,
+    moveCount: result.moveCount,
+    trace: result.trace,
+  };
+
+  writeFileSync(runFile, JSON.stringify(record, null, 2));
+  return runFile;
 }
 
 main();

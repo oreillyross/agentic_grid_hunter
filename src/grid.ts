@@ -45,18 +45,35 @@ export function samePosition(a: Position, b: Position): boolean {
   return a.row === b.row && a.col === b.col;
 }
 
+/** Which hand-placed layout to build — see `createGrid`. */
+export type Layout = "easy" | "hard";
+
 /**
  * Builds a hand-placed, fixed grid layout.
  *
  * Stage 1's acceptance criteria just needs "a grid" — no randomness, no
- * config. Hardcoding a layout here keeps Stage 1 boring on purpose: the goal
+ * config. Hardcoding layouts here keeps things boring on purpose: the goal
  * is proving the round-trip (state -> text -> model -> text), not building a
  * level generator. A random/seeded generator is a natural thing to add once
  * Stage 5 needs a fixed set of eval fixtures — don't build it before you
  * need it.
+ *
+ * "easy" (the Stage 2 default) keeps the trap off the direct path so a
+ * naive agent can stumble into a win. "hard" is Stage 3's layout: the trap
+ * sits directly between player and treasure on the shortest path, so the
+ * plan text actually has to explain a detour instead of just narrating a
+ * straight line.
  */
-export function createGrid(): GridState {
+export function createGrid(layout: Layout = "easy"): GridState {
   const size = 5;
+
+  if (layout === "hard") {
+    const player: Position = { row: 4, col: 0 }; // bottom-left corner
+    const treasure: Position = { row: 4, col: 4 }; // bottom-right corner
+    const trap: Position = { row: 4, col: 2 }; // dead center of the direct path
+    return { size, player, treasure, trap, treasureCollected: false };
+  }
+
   const player: Position = { row: 4, col: 0 }; // bottom-left corner
   const treasure: Position = { row: 0, col: 4 }; // top-right corner
   const trap: Position = { row: 2, col: 2 }; // dead center
