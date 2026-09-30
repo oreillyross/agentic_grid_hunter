@@ -149,6 +149,23 @@ kicks it off.
 
 ---
 
+## Jev agent (alternate brain)
+
+`src/jev-agent.ts` swaps the generative model for [TypeSafe Jev](https://docs.typesafe.ai). Jev can't call tools or write a `<plan>`; it answers typed `Choice` questions with a probability per label. Each turn asks two (`tool: move|look|pickup`, `direction: up|down|left|right`) in one `systemOne` call, then executes through the same `executeTool` and `TraceStep` machinery.
+
+```bash
+cp .env.example .env     # set TYPESAFE_API_KEY
+pnpm start               # AGENT=jev is the default
+AGENT=claude pnpm start  # the Stage 3 Anthropic loop, unchanged
+```
+
+- **Abstain rule:** if the top label's probability is below `0.60` (`MIN_PROBABILITY`), the agent falls back to the free `look()` instead of acting. Illustrative threshold from TypeSafe's consistency cookbook; tune it with Stage 5 evals. Uses `probabilities`, not the `confidence` field.
+- **Stateless:** Jev keeps no conversation, so the last few turns ride along in `state` (`recent_history`) every call.
+- **Trace:** the `plan` field holds the decision's probabilities instead of prose.
+- **Known failure mode:** a run that abstains forever makes no moves; a turn cap (4x the move budget) ends it as `move_limit`.
+
+---
+
 ## Notes for execution
 
 - Each stage should be its own commit/PR, working end-to-end before moving on — same as Pantler slices
