@@ -15,22 +15,31 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { createGrid, renderGrid, describePositions, type Layout } from "./grid.js";
+import { TypeSafeClient } from "@typesafe-ai/sdk";
 import { runAgentLoop } from "./agent.js";
+import { runJevLoop } from "./jev-agent.js";
 
-if (!process.env.ANTHROPIC_API_KEY) {
+// Which brain drives the loop. "jev" (default) = TypeSafe Jev answering typed
+// Choice questions; "claude" = the Stage 3 plan-then-act Anthropic loop.
+const AGENT: "jev" | "claude" = process.env.AGENT === "claude" ? "claude" : "jev";
+
+if (AGENT === "jev" && !process.env.TYPESAFE_API_KEY) {
+  console.error(
+    "Missing TYPESAFE_API_KEY. Copy .env.example to .env and add your key (or run with AGENT=claude)."
+  );
+  process.exit(1);
+}
+if (AGENT === "claude" && !process.env.ANTHROPIC_API_KEY) {
   console.error(
     "Missing ANTHROPIC_API_KEY. Copy .env.example to .env and add your key."
   );
   process.exit(1);
 }
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  defaultHeaders: {
-    'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID,
-  },
-});
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5";
+const MODEL =
+  AGENT === "jev"
+    ? (process.env.TYPESAFE_DEFAULT_MODEL ?? "jev-latest")
+    : (process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5");
 
 // The move-limit end condition from the README ("move limit reached, e.g.
 // 20 moves"). Only `move` tool calls count against this — `look` and
@@ -56,11 +65,26 @@ async function main() {
   console.log();
   console.log(describePositions(state));
   console.log();
-  console.log(`=== Running agent loop (${MODEL}, max ${MAX_MOVES} moves) ===`);
+  console.log(`=== Running ${AGENT} agent loop (${MODEL}, max ${MAX_MOVES} moves) ===`);
   console.log();
 
   const startedAt = new Date();
-  const result = await runAgentLoop(client, MODEL, state, MAX_MOVES);
+  // Clients are built here (not at module load) so only the selected
+  // agent's API key is ever required.
+  const result =
+    AGENT === "jev"
+      ? await runJevLoop(new TypeSafeClient(), state, MAX_MOVES)
+      : await runAgentLoop(
+          new Anthropic({
+            apiKey: process.env.ANTHROPIC_API_KEY,
+            defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID
+              ? { "anthropic-workspace-id": process.env.ANTHROPIC_WORKSPACE_ID }
+              : {},
+          }),
+          MODEL,
+          state,
+          MAX_MOVES
+        );
 
   console.log("=== Run complete ===");
   console.log(`Outcome: ${result.outcome}`);
@@ -88,6 +112,7 @@ function writeTrace(
 
   const record = {
     timestamp: startedAt.toISOString(),
+    agent: AGENT,
     model: MODEL,
     layout: LAYOUT,
     maxMoves: MAX_MOVES,
@@ -100,4 +125,9 @@ function writeTrace(
   return runFile;
 }
 
-main();
+// Handle rejection explicitly: a failed API call should print and exit
+// non-zero, not surface as an unhandled promise rejection.
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exit(1);
+});
