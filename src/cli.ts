@@ -125,4 +125,9 @@ function writeTrace(
   return runFile;
 }
 
-main();
+// Handle rejection explicitly: a failed API call should print and exit
+// non-zero, not surface as an unhandled promise rejection.
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exit(1);
+});
