@@ -40,6 +40,16 @@ export interface GridState {
   treasureCollected: boolean;
 }
 
+/**
+ * What the *agent* is allowed to see. `hideTrap` models fog of war (Stage 4):
+ * the world is unchanged, but the trap is left out of what we render, so the
+ * agent can only learn where it is by `look()`ing or by stepping on it. That
+ * hidden fact is what gives long-term memory something to remember.
+ */
+export interface ViewOptions {
+  hideTrap?: boolean;
+}
+
 /** Two positions are equal if their row AND col both match. */
 export function samePosition(a: Position, b: Position): boolean {
   return a.row === b.row && a.col === b.col;
@@ -102,7 +112,7 @@ export function createGrid(layout: Layout = "easy"): GridState {
  * prompt) is most of the work in a text-only agent — garbage-in-garbage-out
  * applies to the *rendering*, not just the prompt wording.
  */
-export function renderGrid(state: GridState): string {
+export function renderGrid(state: GridState, options: ViewOptions = {}): string {
   const rows: string[] = [];
 
   for (let row = 0; row < state.size; row++) {
@@ -113,7 +123,7 @@ export function renderGrid(state: GridState): string {
         cells.push("P");
       } else if (samePosition(pos, state.treasure)) {
         cells.push("T");
-      } else if (samePosition(pos, state.trap)) {
+      } else if (!options.hideTrap && samePosition(pos, state.trap)) {
         cells.push("X");
       } else {
         cells.push(".");
@@ -136,14 +146,15 @@ export function renderGrid(state: GridState): string {
  * 1 sends both in the prompt so you can literally read the model's reply
  * and see which framing it actually leaned on.
  */
-export function describePositions(state: GridState): string {
+export function describePositions(state: GridState, options: ViewOptions = {}): string {
   const { player, treasure, trap } = state;
-  return [
+  const lines = [
     `Grid size: ${state.size}x${state.size} (rows and cols are 0-indexed, row 0 is the top).`,
     `Player is at (row ${player.row}, col ${player.col}).`,
     `Treasure is at (row ${treasure.row}, col ${treasure.col}).`,
-    `Trap is at (row ${trap.row}, col ${trap.col}).`,
-  ].join("\n");
+  ];
+  if (!options.hideTrap) lines.push(`Trap is at (row ${trap.row}, col ${trap.col}).`);
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------

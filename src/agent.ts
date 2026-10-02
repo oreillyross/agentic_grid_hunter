@@ -20,13 +20,16 @@
 // so a missing plan is logged as a gap and nudged for next turn instead.
 
 import type Anthropic from "@anthropic-ai/sdk";
-import { type GridState, renderGrid } from "./grid.js";
+import { type GridState, type Position, renderGrid } from "./grid.js";
 import { TOOLS, executeTool } from "./tools.js";
+import { createScratchpad, renderScratchpad, updateScratchpad, type Scratchpad } from "./memory.js";
 
 export interface RunResult {
   outcome: "win" | "lose" | "move_limit";
   moveCount: number;
   trace: TraceStep[];
+  /** A trap position the agent found this run (via look() or by hitting it), for long-term memory. */
+  discoveredTrap?: Position;
 }
 
 /**
@@ -45,9 +48,14 @@ export interface TraceStep {
   gridAfter: string;
 }
 
-const SYSTEM_PROMPT = `You are playing a grid-world treasure hunt by calling tools.
+const LEGEND_VISIBLE =
+  "P marks you (the player), T marks the treasure, X marks a trap, . marks an empty cell.";
+const LEGEND_HIDDEN =
+  "P marks you (the player), T marks the treasure, . marks an empty cell. There is a trap somewhere on the grid but it is NOT drawn: look() reports it when it is next to you.";
+
+const SYSTEM_PROMPT_TEMPLATE = (legend: string) => `You are playing a grid-world treasure hunt by calling tools.
 Rows and columns are 0-indexed; row 0 is the top, col 0 is the left.
-P marks you (the player), T marks the treasure, X marks a trap, . marks an empty cell.
+${legend}
 
 You have three tools: move(direction), look(), and pickup(item). Call exactly
 ONE tool per turn. Reaching the treasure's cell does not win by itself — you
@@ -61,6 +69,31 @@ direction yet, so I'll move right.</plan>". Always include the plan block,
 even when the choice feels obvious. After the plan, call exactly one tool.
 Keep any other text reply brief — the plan and the tool call are what
 actually matter each turn.`;
+
+export interface AgentMemoryOptions {
+  /** Fog of war: don't show the trap in the grid or positions (see grid.ts `ViewOptions`). */
+  hideTrap?: boolean;
+  /** Long-term memory text from earlier runs (memory.ts `renderLongTerm`), if any. */
+  longTerm?: string | null;
+}
+
+/**
+ * Rebuilt before *every* API call, because the API is stateless: whatever
+ * the model should "remember" has to be in this request. Short-term memory
+ * (the scratchpad) changes each turn; long-term memory is fixed for the run.
+ */
+function buildSystemPrompt(options: AgentMemoryOptions, scratchpad: Scratchpad): string {
+  const sections = [
+    SYSTEM_PROMPT_TEMPLATE(options.hideTrap ? LEGEND_HIDDEN : LEGEND_VISIBLE),
+    `Scratchpad (this game so far):\n${renderScratchpad(scratchpad)}`,
+  ];
+  if (options.longTerm) {
+    sections.push(
+      `Long-term memory:\n${options.longTerm} Use it, and say so in your <plan> when it affects your choice.`
+    );
+  }
+  return sections.join("\n\n");
+}
 
 const PLAN_TAG_PATTERN = /<plan>([\s\S]*?)<\/plan>/i;
 
@@ -98,8 +131,13 @@ export async function runAgentLoop(
   client: Anthropic,
   model: string,
   state: GridState,
-  maxMoves: number
+  maxMoves: number,
+  options: AgentMemoryOptions = {}
 ): Promise<RunResult> {
+  const view = { hideTrap: options.hideTrap };
+  // Short-term memory: lives and dies with this call.
+  const scratchpad = createScratchpad(state);
+
   // `messages` is the growing conversation history — every turn's request
   // and response gets appended, so the model always sees the full run so
   // far (what it tried, what happened) when deciding its next move. This
@@ -108,7 +146,7 @@ export async function runAgentLoop(
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
-      content: `${renderGrid(state)}\n\nBegin. Write your <plan>, then call a tool.`,
+      content: `${renderGrid(state, view)}\n\nBegin. Write your <plan>, then call a tool.`,
     },
   ];
 
@@ -120,7 +158,7 @@ export async function runAgentLoop(
     const response = await client.messages.create({
       model,
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(options, scratchpad),
       tools: TOOLS,
       messages,
     });
@@ -166,6 +204,7 @@ export async function runAgentLoop(
 
     const { resultText, outcome } = executeTool(state, primary.name, primary.input);
     if (primary.name === "move") moveCount++;
+    updateScratchpad(scratchpad, primary.name, state, outcome);
     turn++;
 
     const planText = plan ?? "(no plan given this turn)";
@@ -207,8 +246,9 @@ export async function runAgentLoop(
 
     messages.push({ role: "user", content: toolResultBlocks });
 
-    if (outcome === "win") return { outcome: "win", moveCount, trace };
-    if (outcome === "lose") return { outcome: "lose", moveCount, trace };
-    if (moveCount >= maxMoves) return { outcome: "move_limit", moveCount, trace };
+    const discoveredTrap = scratchpad.hazards[0];
+    if (outcome === "win") return { outcome: "win", moveCount, trace, discoveredTrap };
+    if (outcome === "lose") return { outcome: "lose", moveCount, trace, discoveredTrap };
+    if (moveCount >= maxMoves) return { outcome: "move_limit", moveCount, trace, discoveredTrap };
   }
 }

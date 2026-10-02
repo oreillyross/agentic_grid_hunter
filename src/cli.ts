@@ -18,6 +18,7 @@ import { createGrid, renderGrid, describePositions, type Layout } from "./grid.j
 import { TypeSafeClient } from "@typesafe-ai/sdk";
 import { runAgentLoop } from "./agent.js";
 import { runJevLoop } from "./jev-agent.js";
+import { loadLayoutMemory, recordRun, renderLongTerm } from "./memory.js";
 
 // Which brain drives the loop. "jev" (default) = TypeSafe Jev answering typed
 // Choice questions; "claude" = the Stage 3 plan-then-act Anthropic loop.
@@ -54,6 +55,19 @@ const MAX_MOVES = Number(process.env.MAX_MOVES ?? 20);
 // `LAYOUT=hard pnpm start` for the Stage 3 acceptance-criteria layout.
 const LAYOUT: Layout = process.env.LAYOUT === "hard" ? "hard" : "easy";
 
+// Stage 4 switches. HIDE_TRAP=1 keeps the trap out of what the agent sees, so
+// it has to discover it — that's what gives long-term memory something to
+// remember. MEMORY=off skips reading and writing memory.json (for A/B runs).
+const HIDE_TRAP = process.env.HIDE_TRAP === "1";
+const MEMORY_ENABLED = process.env.MEMORY !== "off";
+
+if (HIDE_TRAP && AGENT === "jev") {
+  // Jev's state and trap guard read the true trap position, so hiding it
+  // here would only hide it from the printout, not from the decision.
+  console.error("HIDE_TRAP=1 is only supported with AGENT=claude (Jev's guard reads the real trap position).");
+  process.exit(1);
+}
+
 const RUNS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "runs");
 
 async function main() {
@@ -64,6 +78,12 @@ async function main() {
   console.log(renderGrid(state));
   console.log();
   console.log(describePositions(state));
+  console.log();
+  // Long-term memory: only the Claude loop reads it (Stage 4 scope).
+  const useMemory = MEMORY_ENABLED && AGENT === "claude";
+  const longTerm = useMemory ? renderLongTerm(loadLayoutMemory(LAYOUT)) : null;
+  console.log(`Long-term memory: ${longTerm ?? (useMemory ? "nothing remembered for this layout" : "off")}`);
+  console.log(`Trap hidden from agent: ${HIDE_TRAP}`);
   console.log();
   console.log(`=== Running ${AGENT} agent loop (${MODEL}, max ${MAX_MOVES} moves) ===`);
   console.log();
@@ -83,14 +103,30 @@ async function main() {
           }),
           MODEL,
           state,
-          MAX_MOVES
+          MAX_MOVES,
+          { hideTrap: HIDE_TRAP, longTerm }
         );
 
   console.log("=== Run complete ===");
   console.log(`Outcome: ${result.outcome}`);
   console.log(`Moves used: ${result.moveCount}/${MAX_MOVES}`);
 
-  const runFile = writeTrace(startedAt, result);
+  if (useMemory) {
+    recordRun(
+      LAYOUT,
+      {
+        timestamp: startedAt.toISOString(),
+        agent: AGENT,
+        outcome: result.outcome,
+        moveCount: result.moveCount,
+        usedMemory: longTerm !== null,
+      },
+      result.discoveredTrap
+    );
+    console.log(`Memory updated${result.discoveredTrap ? " (trap location learned)" : ""}.`);
+  }
+
+  const runFile = writeTrace(startedAt, result, longTerm !== null);
   console.log(`Trace written to ${runFile}`);
 }
 
@@ -103,7 +139,8 @@ async function main() {
  */
 function writeTrace(
   startedAt: Date,
-  result: Awaited<ReturnType<typeof runAgentLoop>>
+  result: Awaited<ReturnType<typeof runAgentLoop>>,
+  usedMemory: boolean
 ): string {
   mkdirSync(RUNS_DIR, { recursive: true });
 
@@ -116,6 +153,8 @@ function writeTrace(
     model: MODEL,
     layout: LAYOUT,
     maxMoves: MAX_MOVES,
+    hideTrap: HIDE_TRAP,
+    usedMemory,
     outcome: result.outcome,
     moveCount: result.moveCount,
     trace: result.trace,
