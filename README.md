@@ -35,7 +35,11 @@ pnpm typecheck           # tsc --noEmit
 
 Every run also writes its full trace — plan text, action, tool result, and
 resulting state for each turn — to `runs/<timestamp>.json` (gitignored; see
-Stage 3 below).
+Stage 3 below). Claude runs also record token usage per turn and for the whole
+run, plus an estimated cost (see "Cost per run" below).
+
+The Claude loop defaults to `claude-haiku-4-5` (cheapest current model, plenty
+for a 5x5 grid). Override with `ANTHROPIC_MODEL=...` in `.env`.
 
 The source is heavily commented — read `src/grid.ts`, then `src/tools.ts`,
 then `src/agent.ts`, then `src/cli.ts`, in that order, if you're using this
@@ -141,6 +145,21 @@ HIDE_TRAP=1 LAYOUT=hard AGENT=claude npm start      # run 2: plan should cite th
 
 ---
 
+## Cost per run (usage logging)
+
+A single Claude run once cost about 7 cents, which prompted this. Each Claude run now prints, and writes to its trace file, the tokens used per turn and in total (`usage`), plus `estimatedCostUsd` from list prices in `src/usage.ts`. Jev runs don't report usage yet.
+
+**Why a run costs more than it looks like:**
+- The API is stateless, so turn N re-sends the system prompt, the tool schemas and all N−1 earlier turns. Input cost grows roughly with the *square* of the turn count, so a long run costs far more than a short one.
+- Models with thinking on by default bill hidden thinking tokens as output even when the trace shows none. `claude-haiku-4-5` has no thinking by default, one reason it is the default here.
+- No prompt caching is used, so none of the repeated prefix is discounted. Caching wouldn't help yet anyway: the prompt is shorter than the minimum cacheable prefix, and the Stage 4 scratchpad sits in the system prompt, so it changes the prefix every turn.
+
+**Cost levers, in the order to try them:** measure first (this logging), then a cheaper model, then lower effort or thinking where the model supports it (not Haiku 4.5), then caching once the prompt is long enough (move per-turn volatile text such as the scratchpad to the end of the conversation), then fewer wasted turns.
+
+**Caveats:** prices are a cached list-price table in `src/usage.ts`. Check Anthropic's pricing page; an unknown model reports `unknown` rather than a guess. The numbers have only been checked against a scripted stand-in client, not a real billed run, so compare the first real run against your Anthropic usage dashboard.
+
+---
+
 ## Stage 5 — Evals & Observability
 
 **Objective:** This is where "production concerns" stops being abstract — you have ground truth (win/lose, move count) to score against.
@@ -229,6 +248,7 @@ Everything below comes from a handful of hand-read runs on `LAYOUT=hard`, **not*
 Counting beats reading single runs. When `eval.ts` exists, record per run, per layout, per agent:
 
 - **Outcome:** win / trap hit / `move_limit`, plus moves-to-win. This is the ground truth.
+- **Cost per run and cost per win** (from the `usage` / `estimatedCostUsd` trace fields). A cheaper model that wins less often can still be the better buy, so judge cost per *completed task*, not per run.
 - **Trap-hit rate**, separate from the overall win rate.
 - **Abstain rate** (Jev): share of turns below the threshold.
 - **`VETOED` and `STALLED` counts** (Jev): how much the code guard is doing versus the model.
