@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "start": "tsx src/cli.ts",
+    "eval": "tsx src/eval.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -73,6 +73,12 @@ export function updateScratchpad(
   }
 }
 
+/** Folds in the cells and hazards a multi-step tool (navigate_to) found. */
+export function recordNavigation(pad: Scratchpad, visited: readonly Position[], hazards: readonly Position[]): void {
+  for (const pos of visited) addUnique(pad.visited, pos);
+  for (const pos of hazards) addUnique(pad.hazards, pos);
+}
+
 export function renderScratchpad(pad: Scratchpad): string {
   const visited = pad.visited.map(formatPosition).join(", ");
   const hazards = pad.hazards.length > 0 ? pad.hazards.map(formatPosition).join(", ") : "none found yet";

@@ -21,8 +21,8 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 import { type GridState, type Position, renderGrid } from "./grid.js";
-import { TOOLS, executeTool } from "./tools.js";
-import { createScratchpad, renderScratchpad, updateScratchpad, type Scratchpad } from "./memory.js";
+import { TOOLS, NAVIGATE_TOOL, executeTool, type ToolContext } from "./tools.js";
+import { createScratchpad, recordNavigation, renderScratchpad, updateScratchpad, type Scratchpad } from "./memory.js";
 import { addUsage, emptyUsage, fromApiUsage, type Usage } from "./usage.js";
 
 export interface RunResult {
@@ -31,6 +31,8 @@ export interface RunResult {
   trace: TraceStep[];
   /** Summed token usage over every API call this run (Claude loop only). */
   usage?: Usage;
+  /** Set when more than one model was billed (planner + executor): overrides cost-from-`usage`. */
+  costUsd?: number | null;
   /** A trap position the agent found this run (via look() or by hitting it), for long-term memory. */
   discoveredTrap?: Position;
 }
@@ -58,12 +60,17 @@ const LEGEND_VISIBLE =
 const LEGEND_HIDDEN =
   "P marks you (the player), T marks the treasure, . marks an empty cell. There is a trap somewhere on the grid but it is NOT drawn: look() reports it when it is next to you.";
 
-const SYSTEM_PROMPT_TEMPLATE = (legend: string) => `You are playing a grid-world treasure hunt by calling tools.
+const NAVIGATE_NOTE = `
+You also have navigate_to(row, col): it walks a shortest safe path to that cell
+in a single call, avoiding known traps and, if the trap is hidden, looking
+ahead and routing around it. Prefer it to repeated move calls.`;
+
+const SYSTEM_PROMPT_TEMPLATE = (legend: string, navigate: boolean) => `You are playing a grid-world treasure hunt by calling tools.
 Rows and columns are 0-indexed; row 0 is the top, col 0 is the left.
 ${legend}
 
-You have three tools: move(direction), look(), and pickup(item). Call exactly
-ONE tool per turn. Reaching the treasure's cell does not win by itself — you
+You have ${navigate ? "four tools: move(direction), look(), pickup(item), and navigate_to(row, col)" : "three tools: move(direction), look(), and pickup(item)"}. Call exactly
+ONE tool per turn.${navigate ? NAVIGATE_NOTE : ""} Reaching the treasure's cell does not win by itself — you
 must pickup("treasure") while standing on it. Stepping onto the trap loses
 immediately. Use look() if you're unsure what's next to you before moving.
 
@@ -80,6 +87,32 @@ export interface AgentMemoryOptions {
   hideTrap?: boolean;
   /** Long-term memory text from earlier runs (memory.ts `renderLongTerm`), if any. */
   longTerm?: string | null;
+  /** The trap position long-term memory holds, as data (navigate_to needs it, the prompt only has text). */
+  rememberedTrap?: Position | null;
+  /** Offer the deterministic navigate_to tool (see tools.ts). Off by default: it changes the experiment. */
+  navigate?: boolean;
+  /**
+   * Stage 6 handoff, planner -> executor: the planner's current strategy.
+   * Read fresh before every API call, so a revision takes effect next turn.
+   */
+  strategy?: { text: string };
+  /**
+   * Stage 6 handoff, executor -> planner: called after every `checkpointEvery`
+   * turns and whenever a new hazard shows up. The planner may revise `strategy`.
+   */
+  checkpoint?: (report: ExecutorReport) => Promise<void>;
+  checkpointEvery?: number;
+}
+
+/** What the executor tells the planner at a checkpoint — the whole "report back" contract. */
+export interface ExecutorReport {
+  reason: "hazard" | "periodic";
+  turn: number;
+  moveCount: number;
+  player: Position;
+  hazards: Position[];
+  /** The last few turns as one-line summaries: "move(...) -> result". */
+  recent: string[];
 }
 
 /**
@@ -89,15 +122,30 @@ export interface AgentMemoryOptions {
  */
 function buildSystemPrompt(options: AgentMemoryOptions, scratchpad: Scratchpad): string {
   const sections = [
-    SYSTEM_PROMPT_TEMPLATE(options.hideTrap ? LEGEND_HIDDEN : LEGEND_VISIBLE),
+    SYSTEM_PROMPT_TEMPLATE(options.hideTrap ? LEGEND_HIDDEN : LEGEND_VISIBLE, options.navigate === true),
     `Scratchpad (this game so far):\n${renderScratchpad(scratchpad)}`,
   ];
+  if (options.strategy) {
+    sections.push(
+      `Strategy from your planner:\n${options.strategy.text}\nFollow it unless the world contradicts it. You choose the individual tool calls; the planner chose the direction.`
+    );
+  }
   if (options.longTerm) {
     sections.push(
       `Long-term memory:\n${options.longTerm} Use it, and say so in your <plan> when it affects your choice.`
     );
   }
   return sections.join("\n\n");
+}
+
+/**
+ * What the agent can legitimately route around: the trap if it is drawn on the
+ * grid, otherwise whatever it has found or remembered. Never the true trap
+ * position under fog of war — that would be cheating.
+ */
+function knownHazards(state: GridState, options: AgentMemoryOptions, pad: Scratchpad): Position[] {
+  if (!options.hideTrap) return [state.trap];
+  return options.rememberedTrap ? [...pad.hazards, options.rememberedTrap] : pad.hazards;
 }
 
 const PLAN_TAG_PATTERN = /<plan>([\s\S]*?)<\/plan>/i;
@@ -165,7 +213,7 @@ export async function runAgentLoop(
       model,
       max_tokens: 1024,
       system: buildSystemPrompt(options, scratchpad),
-      tools: TOOLS,
+      tools: options.navigate ? [...TOOLS, NAVIGATE_TOOL] : TOOLS,
       messages,
     });
 
@@ -213,9 +261,17 @@ export async function runAgentLoop(
     const extras = toolUseBlocks.slice(1);
     const toolResultBlocks: Anthropic.ToolResultBlockParam[] = [];
 
-    const { resultText, outcome } = executeTool(state, primary.name, primary.input);
-    if (primary.name === "move") moveCount++;
+    const toolContext: ToolContext = {
+      knownHazards: knownHazards(state, options, scratchpad),
+      hideTrap: options.hideTrap === true,
+      movesLeft: maxMoves - moveCount,
+    };
+    const hazardsBefore = scratchpad.hazards.length;
+    const executed = executeTool(state, primary.name, primary.input, toolContext);
+    const { resultText, outcome } = executed;
+    moveCount += executed.moves ?? (primary.name === "move" ? 1 : 0);
     updateScratchpad(scratchpad, primary.name, state, outcome);
+    if (executed.visited) recordNavigation(scratchpad, executed.visited, executed.discoveredHazards ?? []);
     turn++;
 
     const planText = plan ?? "(no plan given this turn)";
@@ -260,6 +316,20 @@ export async function runAgentLoop(
     messages.push({ role: "user", content: toolResultBlocks });
 
     const discoveredTrap = scratchpad.hazards[0];
+    const gameOver = outcome !== "ok" || moveCount >= maxMoves;
+    if (!gameOver && options.checkpoint) {
+      const newHazard = scratchpad.hazards.length > hazardsBefore;
+      if (newHazard || (options.checkpointEvery && turn % options.checkpointEvery === 0)) {
+        await options.checkpoint({
+          reason: newHazard ? "hazard" : "periodic",
+          turn,
+          moveCount,
+          player: { ...state.player },
+          hazards: scratchpad.hazards.map((pos) => ({ ...pos })),
+          recent: trace.slice(-3).map((step) => `${step.action.tool}(${JSON.stringify(step.action.input)}) -> ${step.result}`),
+        });
+      }
+    }
     if (outcome === "win") return { outcome: "win", moveCount, trace, discoveredTrap, usage: totalUsage };
     if (outcome === "lose") return { outcome: "lose", moveCount, trace, discoveredTrap, usage: totalUsage };
     if (moveCount >= maxMoves) {

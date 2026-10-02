@@ -13,35 +13,36 @@ import "dotenv/config"; // loads .env into process.env — see .env.example
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import Anthropic from "@anthropic-ai/sdk";
-import { createGrid, renderGrid, describePositions, type Layout } from "./grid.js";
-import { TypeSafeClient } from "@typesafe-ai/sdk";
-import { runAgentLoop } from "./agent.js";
-import { runJevLoop } from "./jev-agent.js";
+import { createGrid, renderGrid, describePositions, isLayout, LAYOUT_NAMES, type Layout } from "./grid.js";
+import type { RunResult } from "./agent.js";
 import { loadLayoutMemory, recordRun, renderLongTerm } from "./memory.js";
-import { estimateCostUsd, formatCost } from "./usage.js";
+import { agentLabel, buildRunner, missingKey, modelFor, parseAgentConfig, runCostUsd, type AgentConfig } from "./runners.js";
+import { formatCost } from "./usage.js";
 
-// Which brain drives the loop. "jev" (default) = TypeSafe Jev answering typed
-// Choice questions; "claude" = the Stage 3 plan-then-act Anthropic loop.
-const AGENT: "jev" | "claude" = process.env.AGENT === "claude" ? "claude" : "jev";
-
-if (AGENT === "jev" && !process.env.TYPESAFE_API_KEY) {
-  console.error(
-    "Missing TYPESAFE_API_KEY. Copy .env.example to .env and add your key (or run with AGENT=claude)."
-  );
+// Which brain drives the loop (see runners.ts for the full list):
+//   jev (default)  TypeSafe Jev answering typed Choice questions
+//   claude         the Stage 3/4 plan-then-act Anthropic loop
+//   planner        Stage 6: a planner model steering an executor model
+//   classic        no model at all: BFS, $0 (solver.ts) — the cost-effective baseline
+// NAVIGATE=1 additionally gives claude/planner the navigate_to tool, which
+// walks a BFS path in one call. AGENT=claude+nav is the same thing.
+const agentText = (process.env.AGENT ?? "jev") + (process.env.NAVIGATE === "1" && !(process.env.AGENT ?? "").includes("+nav") ? "+nav" : "");
+let CONFIG: AgentConfig;
+try {
+  CONFIG = parseAgentConfig(agentText);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
   process.exit(1);
 }
-if (AGENT === "claude" && !process.env.ANTHROPIC_API_KEY) {
-  console.error(
-    "Missing ANTHROPIC_API_KEY. Copy .env.example to .env and add your key."
-  );
+const AGENT = CONFIG.brain;
+
+const missing = missingKey(CONFIG);
+if (missing) {
+  console.error(`Missing ${missing}. Copy .env.example to .env and add your key (or try AGENT=classic, which needs none).`);
   process.exit(1);
 }
 
-const MODEL =
-  AGENT === "jev"
-    ? (process.env.TYPESAFE_DEFAULT_MODEL ?? "jev-latest")
-    : (process.env.ANTHROPIC_MODEL ?? "claude-haiku-4-5");
+const MODEL = modelFor(CONFIG);
 
 // The move-limit end condition from the README ("move limit reached, e.g.
 // 20 moves"). Only `move` tool calls count against this — `look` and
@@ -51,10 +52,15 @@ const MAX_MOVES = Number(process.env.MAX_MOVES ?? 20);
 
 // "easy" is Stage 2's original layout (trap off the direct path). "hard" is
 // Stage 3's addition: the trap sits directly between player and treasure,
-// so the plan text has to explain a detour — see grid.ts. Defaults to
-// "easy" to keep `pnpm start` matching Stage 2's behavior; run
-// `LAYOUT=hard pnpm start` for the Stage 3 acceptance-criteria layout.
-const LAYOUT: Layout = process.env.LAYOUT === "hard" ? "hard" : "easy";
+// so the plan text has to explain a detour — see grid.ts. Stage 5 added eight
+// more fixtures (LAYOUT_NAMES). Defaults to "easy" to keep `pnpm start`
+// matching Stage 2's behavior.
+const layoutName = process.env.LAYOUT ?? "easy";
+if (!isLayout(layoutName)) {
+  console.error(`Unknown LAYOUT "${layoutName}". Choose one of: ${LAYOUT_NAMES.join(", ")}.`);
+  process.exit(1);
+}
+const LAYOUT: Layout = layoutName;
 
 // Stage 4 switches. HIDE_TRAP=1 keeps the trap out of what the agent sees, so
 // it has to discover it — that's what gives long-term memory something to
@@ -80,45 +86,34 @@ async function main() {
   console.log();
   console.log(describePositions(state));
   console.log();
-  // Long-term memory: only the Claude loop reads it (Stage 4 scope).
-  const useMemory = MEMORY_ENABLED && AGENT === "claude";
-  const longTerm = useMemory ? renderLongTerm(loadLayoutMemory(LAYOUT)) : null;
+  // Long-term memory: everything except Jev reads it (Jev's state is fixed).
+  const useMemory = MEMORY_ENABLED && AGENT !== "jev";
+  const layoutMemory = useMemory ? loadLayoutMemory(LAYOUT) : null;
+  const longTerm = useMemory ? renderLongTerm(layoutMemory) : null;
   console.log(`Long-term memory: ${longTerm ?? (useMemory ? "nothing remembered for this layout" : "off")}`);
   console.log(`Trap hidden from agent: ${HIDE_TRAP}`);
   console.log();
-  console.log(`=== Running ${AGENT} agent loop (${MODEL}, max ${MAX_MOVES} moves) ===`);
+  console.log(`=== Running ${agentLabel(CONFIG)} (${MODEL}, max ${MAX_MOVES} moves) ===`);
   console.log();
 
   const startedAt = new Date();
-  // Clients are built here (not at module load) so only the selected
-  // agent's API key is ever required.
-  const result =
-    AGENT === "jev"
-      ? await runJevLoop(new TypeSafeClient(), state, MAX_MOVES)
-      : await runAgentLoop(
-          new Anthropic({
-            apiKey: process.env.ANTHROPIC_API_KEY,
-            defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID
-              ? { "anthropic-workspace-id": process.env.ANTHROPIC_WORKSPACE_ID }
-              : {},
-          }),
-          MODEL,
-          state,
-          MAX_MOVES,
-          { hideTrap: HIDE_TRAP, longTerm }
-        );
+  const result = await buildRunner(CONFIG)(state, MAX_MOVES, {
+    hideTrap: HIDE_TRAP,
+    longTerm,
+    rememberedTrap: layoutMemory?.trap ?? null,
+  });
 
   console.log("=== Run complete ===");
   console.log(`Outcome: ${result.outcome}`);
   console.log(`Moves used: ${result.moveCount}/${MAX_MOVES}`);
-  const estimatedCostUsd = result.usage ? estimateCostUsd(MODEL, result.usage) : null;
+  const estimatedCostUsd = runCostUsd(result);
   if (result.usage) {
     const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = result.usage;
     console.log(
       `Tokens: ${inputTokens} in / ${outputTokens} out` +
         (cacheReadTokens + cacheWriteTokens > 0 ? ` (cache: ${cacheReadTokens} read, ${cacheWriteTokens} written)` : "")
     );
-    console.log(`Estimated cost: ${formatCost(estimatedCostUsd)} (${MODEL}, list prices)`);
+    console.log(`Estimated cost: ${formatCost(estimatedCostUsd)} (list prices)`);
   }
 
   if (useMemory) {
@@ -126,7 +121,7 @@ async function main() {
       LAYOUT,
       {
         timestamp: startedAt.toISOString(),
-        agent: AGENT,
+        agent: agentLabel(CONFIG),
         outcome: result.outcome,
         moveCount: result.moveCount,
         usedMemory: longTerm !== null,
@@ -149,7 +144,7 @@ async function main() {
  */
 function writeTrace(
   startedAt: Date,
-  result: Awaited<ReturnType<typeof runAgentLoop>>,
+  result: RunResult,
   usedMemory: boolean,
   estimatedCostUsd: number | null
 ): string {
@@ -160,7 +155,7 @@ function writeTrace(
 
   const record = {
     timestamp: startedAt.toISOString(),
-    agent: AGENT,
+    agent: agentLabel(CONFIG),
     model: MODEL,
     layout: LAYOUT,
     maxMoves: MAX_MOVES,

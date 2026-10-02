@@ -15,6 +15,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   type GridState,
+  type Position,
   type Direction,
   type CellContent,
   DIRECTION_OFFSETS,
@@ -23,6 +24,7 @@ import {
   inBounds,
   samePosition,
 } from "./grid.js";
+import { walkTo } from "./solver.js";
 
 /**
  * The schemas handed to the API via `messages.create({ tools: TOOLS, ... })`.
@@ -75,6 +77,36 @@ export const TOOLS: Anthropic.Tool[] = [
 ];
 
 /**
+ * Optional tool: the deterministic "how" behind the model's "what". Instead of
+ * issuing one `move` per turn (and paying for the whole history each time),
+ * the model names a destination and BFS in solver.ts walks there. Not in
+ * `TOOLS` on purpose: it changes the experiment, so it is opt-in (NAVIGATE=1).
+ */
+export const NAVIGATE_TOOL: Anthropic.Tool = {
+  name: "navigate_to",
+  description:
+    "Walk the player along a shortest safe path to the given cell, in one call. Avoids every trap you know about and, if the trap is hidden, looks ahead and routes around it automatically. Counts one move per step. Much cheaper than calling move repeatedly. Stops early if the destination is unreachable or the move limit is hit.",
+  input_schema: {
+    type: "object",
+    properties: {
+      row: { type: "integer", description: "Destination row (0 is the top)." },
+      col: { type: "integer", description: "Destination column (0 is the left)." },
+    },
+    required: ["row", "col"],
+  },
+};
+
+/** What the executor needs to know about the run, beyond the grid itself. */
+export interface ToolContext {
+  /** Hazards the agent knows about (what it can see, remembers or has found). */
+  knownHazards: readonly Position[];
+  /** Fog of war is on: navigate_to must look before stepping. */
+  hideTrap: boolean;
+  /** Move budget left, so navigate_to can't overspend it. */
+  movesLeft: number;
+}
+
+/**
  * What running a tool call means for the loop in agent.ts:
  * - "ok": the game continues, `resultText` is fed back as the tool_result.
  * - "win": treasure collected, the loop should stop and report a win.
@@ -87,6 +119,11 @@ export const TOOLS: Anthropic.Tool[] = [
 export interface ToolExecutionResult {
   resultText: string;
   outcome: "ok" | "win" | "lose";
+  /** Set by multi-step tools (navigate_to). Plain `move` leaves it to the caller. */
+  moves?: number;
+  /** Cells entered / traps found by a multi-step tool, for the scratchpad. */
+  visited?: Position[];
+  discoveredHazards?: Position[];
 }
 
 function describeAdjacent(state: GridState): string {
@@ -115,9 +152,39 @@ function describeAdjacent(state: GridState): string {
 export function executeTool(
   state: GridState,
   toolName: string,
-  input: unknown
+  input: unknown,
+  context?: ToolContext
 ): ToolExecutionResult {
   switch (toolName) {
+    case "navigate_to": {
+      const { row, col } = (input ?? {}) as { row?: unknown; col?: unknown };
+      if (!context) return { resultText: "navigate_to is not available in this run.", outcome: "ok" };
+      if (!Number.isInteger(row) || !Number.isInteger(col)) {
+        return { resultText: `Invalid destination: ${JSON.stringify(input)}.`, outcome: "ok" };
+      }
+      const target: Position = { row: row as number, col: col as number };
+      if (!inBounds(state, target)) {
+        return { resultText: `(row ${target.row}, col ${target.col}) is off the grid.`, outcome: "ok" };
+      }
+      const walk = walkTo(state, target, {
+        hazards: context.knownHazards,
+        hideTrap: context.hideTrap,
+        maxSteps: context.movesLeft,
+      });
+      const base = { moves: walk.steps, visited: walk.visited, discoveredHazards: walk.discoveredHazards };
+      const found = walk.discoveredHazards.length > 0 ? " Found a trap on the way and routed around it." : "";
+      switch (walk.status) {
+        case "arrived":
+          return { ...base, resultText: `Arrived at (row ${target.row}, col ${target.col}) in ${walk.steps} moves.${found}`, outcome: "ok" };
+        case "lost":
+          return { ...base, resultText: `Walked onto the trap after ${walk.steps} moves. Game over — you lose.`, outcome: "lose" };
+        case "blocked":
+          return { ...base, resultText: `No safe route to (row ${target.row}, col ${target.col}) from here. Stopped after ${walk.steps} moves.`, outcome: "ok" };
+        case "out_of_moves":
+          return { ...base, resultText: `Ran out of moves after ${walk.steps} steps, short of the destination.`, outcome: "ok" };
+      }
+    }
+
     case "move": {
       const direction = (input as { direction?: string } | null)?.direction;
       if (
