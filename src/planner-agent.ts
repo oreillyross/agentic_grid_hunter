@@ -13,7 +13,8 @@
 // THE HANDOFF CONTRACT (the part worth reading):
 //
 //   planner -> executor : one `<strategy>` text block, max ~3 sentences, naming
-//                         the route, any hazard to avoid, and when to look().
+//                         the route and any hazard to avoid. (What it says about
+//                         look() is the thing the eval caught: see PROMPT_V1.)
 //                         Lands in the executor's system prompt, and is re-read
 //                         before every executor API call.
 //   executor -> planner : an `ExecutorReport` (agent.ts) — reason, turn, move
@@ -40,12 +41,32 @@ import { addUsage, emptyUsage, estimateCostUsd, fromApiUsage, type Usage } from 
 /** Executor reports back this often even when nothing went wrong. */
 export const CHECKPOINT_EVERY = 4;
 
-const PLANNER_SYSTEM_PROMPT = `You are the PLANNER in a two-agent team playing a grid-world treasure hunt. A separate EXECUTOR agent makes every actual move; you never act.
-Rows and columns are 0-indexed; row 0 is the top. The executor can move(direction), look() at adjacent cells, and pickup("treasure"). Stepping on the trap loses. Reaching the treasure only wins after pickup.
+const PLANNER_ROLE = `You are the PLANNER in a two-agent team playing a grid-world treasure hunt. A separate EXECUTOR agent makes every actual move; you never act.
+Rows and columns are 0-indexed; row 0 is the top. The executor can move(direction), look() at adjacent cells, and pickup("treasure"). Stepping on the trap loses. Reaching the treasure only wins after pickup.`;
+
+// v1: the original wording. Told the executor "when to look() before stepping",
+// and under HIDE_TRAP the executor took that as "look before EVERY step":
+// every planner run in the first real eval took moves x 2 + 1 turns (17 turns
+// for an 8-move game), about 2x the cost of a lone Claude, with no extra wins.
+const PROMPT_V1 = `${PLANNER_ROLE}
 
 Write a SHORT strategy for the executor: at most three sentences, no per-move instructions. Say which general route to take, which hazard to avoid and how, and when to look() before stepping. If a hazard is hidden, say where it is probably NOT, or tell the executor to look() when near unexplored cells.
 
 Reply with only: <strategy>...</strategy>`;
+
+// v2 (default): the fix the eval pointed at. look() adds no move but costs a
+// full model turn, and each turn re-sends the whole history, so the planner is
+// told what a look costs and not to prescribe one per step.
+const PROMPT_V2 = `${PLANNER_ROLE}
+
+Write a SHORT strategy for the executor: at most three sentences, no per-move instructions. Say which general route to take and which hazard to avoid and how. Prefer routes that have several equally short alternatives, so a hazard found late can be routed around.
+
+Do NOT tell the executor to look() before every move or "when near unexplored cells". Each look() costs a full extra turn and the executor already knows it may look. Mention look() at most once, and only for one specific spot where a hidden hazard would be hard to avoid later.
+
+Reply with only: <strategy>...</strategy>`;
+
+/** PLANNER_PROMPT=v1 reproduces the pre-eval wording, for before/after comparisons. */
+export const plannerPromptVersion = (): "v1" | "v2" => (process.env.PLANNER_PROMPT === "v1" ? "v1" : "v2");
 
 const STRATEGY_PATTERN = /<strategy>([\s\S]*?)<\/strategy>/i;
 
@@ -59,7 +80,7 @@ async function askPlanner(call: PlannerCall, userText: string, fallback: string)
   const response = await call.client.messages.create({
     model: call.model,
     max_tokens: 400,
-    system: PLANNER_SYSTEM_PROMPT,
+    system: plannerPromptVersion() === "v1" ? PROMPT_V1 : PROMPT_V2,
     messages: [{ role: "user", content: userText }],
   });
   addUsage(call.usage, fromApiUsage(response.usage));
@@ -100,7 +121,7 @@ export async function runPlannerExecutorLoop(
   ]
     .filter(Boolean)
     .join("\n\n");
-  strategy.text = await askPlanner(planner, `${initialContext}\n\nWrite the opening strategy.`, "Head for the treasure; look() before stepping near anything unknown.");
+  strategy.text = await askPlanner(planner, `${initialContext}\n\nWrite the opening strategy.`, plannerPromptVersion() === "v1" ? "Head for the treasure; look() before stepping near anything unknown." : "Head for the treasure by a shortest route; adjust if a hazard is reported.");
   console.log(`[planner] opening strategy: ${strategy.text}\n`);
 
   const checkpoint = async (report: ExecutorReport): Promise<void> => {

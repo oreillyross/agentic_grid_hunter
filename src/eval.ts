@@ -31,6 +31,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LAYOUT_NAMES, createGrid, isLayout, type Layout } from "./grid.js";
 import { optimalMoves } from "./solver.js";
+import type { TraceStep } from "./agent.js";
+import { plannerPromptVersion } from "./planner-agent.js";
 import { agentLabel, buildRunner, missingKey, modelFor, parseAgentConfig, runCostUsd, type AgentConfig } from "./runners.js";
 import { formatCost } from "./usage.js";
 
@@ -42,6 +44,8 @@ interface RunScore {
   turns: number;
   costUsd: number | null;
   error?: string;
+  /** Full trace, kept only for games that didn't win: a score says THAT it failed, a trace says WHY. */
+  trace?: TraceStep[];
 }
 
 interface Cell {
@@ -83,7 +87,9 @@ async function quietly<T>(task: () => Promise<T>): Promise<T> {
 async function playOnce(config: AgentConfig, layout: Layout): Promise<RunScore> {
   try {
     const result = await quietly(() => buildRunner(config)(createGrid(layout), MAX_MOVES, { hideTrap: HIDE_TRAP }));
-    return { outcome: result.outcome, moves: result.moveCount, turns: result.trace.length, costUsd: runCostUsd(result) };
+    const score: RunScore = { outcome: result.outcome, moves: result.moveCount, turns: result.trace.length, costUsd: runCostUsd(result) };
+    if (result.outcome !== "win") score.trace = result.trace;
+    return score;
   } catch (error) {
     return { outcome: "error", moves: 0, turns: 0, costUsd: null, error: error instanceof Error ? error.message : String(error) };
   }
@@ -140,26 +146,46 @@ async function main(): Promise<void> {
   if (paid) console.log(`  Spend brake: stops starting new games past ~${formatCost(MAX_COST_USD)} (MAX_COST_USD).`);
   console.log();
 
-  const cells: Cell[] = [];
+  const cells: Cell[] = layouts.flatMap((layout) => labels.map((agent) => ({ layout, agent, runs: [] as RunScore[] })));
+  const cellFor = (layout: Layout, agent: string) => cells.find((c) => c.layout === layout && c.agent === agent)!;
+  mkdirSync(RUNS_DIR, { recursive: true });
+  const file = join(RUNS_DIR, `eval-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   let spent = 0;
   let braked = false;
 
-  for (const layout of layouts) {
-    for (const config of configs) {
-      const cell: Cell = { layout, agent: agentLabel(config), runs: [] };
-      cells.push(cell);
-      for (let i = 0; i < RUNS; i++) {
+  // Written after EVERY game, so Ctrl+C, a crash or the spend brake never costs
+  // the games already paid for. `finished` flips to true only at the end.
+  const save = (finished: boolean) =>
+    writeFileSync(
+      file,
+      JSON.stringify(
+        { finished, runsPerCell: RUNS, maxMoves: MAX_MOVES, hideTrap: HIDE_TRAP, plannerPrompt: plannerPromptVersion(), agents: labels, models: Object.fromEntries(configs.map((c) => [agentLabel(c), modelFor(c)])), estimatedSpendUsd: spent, cells },
+        null,
+        2
+      )
+    );
+  save(false);
+  console.log(`Saving after every game to ${file}\n`);
+
+  // Pass-major order: one game per (layout, agent) per pass. If the spend
+  // brake trips, every layout has had the same number of games (give or take
+  // one pass), instead of the last layouts being dropped entirely.
+  passes: for (let pass = 1; pass <= RUNS; pass++) {
+    for (const layout of layouts) {
+      for (const config of configs) {
         if (spent > MAX_COST_USD) {
           braked = true;
-          break;
+          break passes;
         }
         const score = await playOnce(config, layout);
         spent += score.costUsd ?? 0;
-        cell.runs.push(score);
+        cellFor(layout, agentLabel(config)).runs.push(score);
+        save(false);
       }
-      process.stdout.write(`  ${layout.padEnd(17)} ${cell.agent.padEnd(12)} ${cell.runs.filter((r) => r.outcome === "win").length}/${cell.runs.length} won\n`);
     }
+    console.log(`  pass ${pass}/${RUNS} done, estimated spend so far ${formatCost(spent)}`);
   }
+  save(true);
   console.log();
 
   // Table 1: per layout, one column per agent: "wins/games · avg moves when winning".
@@ -200,18 +226,14 @@ async function main(): Promise<void> {
     ];
   });
   printTable(["agent", "win", "trap", "limit", "err", "moves/win", "vs opt", "turns", "$/run", "$/win"], rows);
-  if (braked) console.log(`\nStopped early: estimated spend passed ${formatCost(MAX_COST_USD)}. Skipped games are not counted above.`);
+  if (braked) console.log(`\nStopped early: estimated spend passed ${formatCost(MAX_COST_USD)}. Games not played are not counted above.`);
   if (cells.some((c) => c.runs.some((r) => r.error))) {
     const first = cells.flatMap((c) => c.runs).find((r) => r.error);
     console.log(`\nSome runs errored (counted as "err"), e.g.: ${first?.error}`);
   }
 
-  mkdirSync(RUNS_DIR, { recursive: true });
-  const file = join(RUNS_DIR, `eval-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
-  writeFileSync(
-    file,
-    JSON.stringify({ runsPerCell: RUNS, maxMoves: MAX_MOVES, hideTrap: HIDE_TRAP, agents: labels, models: Object.fromEntries(configs.map((c) => [agentLabel(c), modelFor(c)])), estimatedSpendUsd: spent, cells }, null, 2)
-  );
+  const failed = cells.flatMap((c) => c.runs.filter((r) => r.trace).map((r) => `${c.layout}/${c.agent}: ${r.outcome}`));
+  if (failed.length > 0) console.log(`\nTraces kept for ${failed.length} non-winning game(s): ${failed.join(", ")}`);
   console.log(`\nResults written to ${file}`);
 }
 

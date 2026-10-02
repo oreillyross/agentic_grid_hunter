@@ -181,7 +181,8 @@ A single Claude run once cost about 7 cents, which prompted this. Each Claude ru
 **What's built:**
 - **Ten fixtures** in `LAYOUTS` (`grid.ts`), from "treasure is next to you" to a 7x7 board and a trap guarding the treasure. `LAYOUT=<name>` selects one for a single game.
 - **`eval.ts`** (`pnpm eval`): plays every layout x agent N times (`EVAL_RUNS`, default 5) on a fresh grid and prints two tables: wins/games and average moves per layout (next to the shortest possible, `opt`, computed by BFS), then per-agent totals: win %, trap-hit %, move-limit %, errors, moves per win, moves over optimal, turns, cost per run and **cost per win**.
-- **A spend brake.** `MAX_COST_USD` (default 2) stops the eval starting new games once the estimated spend passes it; an unattended loop over a paid API needs one. A real run is 10 layouts x 5 runs x agents, so check the arithmetic first: Haiku runs were roughly a cent each, Sonnet several times that.
+- **A spend brake.** `MAX_COST_USD` (default 2) stops the eval starting new games once the estimated spend passes it; an unattended loop over a paid API needs one. Games are played one pass at a time (one game per layout and agent per pass), so if the brake trips every layout has the same number of games, give or take one pass. The first real eval ran layout-by-layout instead and the brake dropped the three hardest layouts entirely.
+- **Saved after every game**, and the full trace is kept for every game that didn't win, so Ctrl+C or the brake never loses what was already paid for, and a loss can be read, not just counted. The file has `"finished": false` until the run completes. A real run is 10 layouts x 5 runs x agents, so check the arithmetic first: Haiku runs were roughly a cent each, Sonnet several times that.
 - Memory is **off** during evals so run 5 isn't graded against what run 1 learned. Results are saved to `runs/eval-<timestamp>.json`, so before/after is two files.
 - Agents are named by config strings (`runners.ts`): `classic`, `claude`, `claude+nav`, `planner`, `planner+nav`, `jev`. `HIDE_TRAP=1` turns on fog of war for all of them (Jev can't play it).
 
@@ -191,11 +192,24 @@ EVAL_AGENTS=classic,claude,planner EVAL_RUNS=3 pnpm eval
 HIDE_TRAP=1 EVAL_AGENTS=classic,claude pnpm eval       # trap only found by look()
 ```
 
-**Status:** the harness runs end to end. `classic` scores 100% on all ten layouts at the optimal move count, $0. The Claude and planner paths were checked only with a scripted stand-in client (plumbing, accounting, handoff), **never against the real API**, so there are no Claude win rates in this repo yet. The second acceptance criterion, a change driven by eval numbers with before/after, needs your real runs: run the eval, pick the worst row (the "Questions for Stage 5" list below has candidate experiments), change one thing, re-run, and compare the two `runs/eval-*.json` files.
+**First real eval** (`HIDE_TRAP=1`, 3 runs, 7 of 10 layouts before the $2 brake, ~$2.04 spent; the three hardest layouts never ran):
+
+| agent | win | avg turns | $/run | share of spend |
+|---|---|---|---|---|
+| classic | 100% (21/21) | 2.0 | $0 | 0% |
+| claude | 95% (20/21) | 9.5 | $0.032 | 33% |
+| claude+nav | 100% (21/21) | 2.2 | $0.005 | 5% |
+| planner | 100% (20/20) | 11.8 | $0.063 | 62% |
+
+What it showed: wins barely separate the agents on these layouts (the one loss was plain `claude` stepping on the hidden trap on `hard`, 1 game in 21, too few to conclude anything). Cost tracks turns, and turns are quadratic: 17 turns cost $0.082 and 8 turns $0.017 on near-identical games. The planner cost about 2x a lone Claude on every layout for no extra wins, and every planner game took `moves x 2 + 1` turns (17 for an 8-move game): the executor looked before every step, because the planner's strategy told it "when to look()". `look()` adds no move but costs a full paid turn.
+
+**The change driven by that result:** the planner prompt (`planner-agent.ts`) now tells the planner what a look costs and not to prescribe one per step. `PLANNER_PROMPT=v1` reproduces the old wording. Before/after is `PLANNER_PROMPT=v1 EVAL_AGENTS=planner ...` against the default, same layouts. **The "after" numbers are not collected yet.**
+
+**Harness status:** the harness runs end to end. `classic` scores 100% on all ten layouts at the optimal move count, $0. The first real-API eval is in the table above; the three hardest layouts (`guarded_treasure`, `squeeze`, `big_7x7`) still have no Claude numbers.
 
 **Acceptance criteria:**
 - Eval script runs unattended and produces a scorecard — **met** (`pnpm eval`).
-- You've made at least one change driven by eval results, not guesswork, and can show before/after numbers — **open, needs real API runs.**
+- You've made at least one change driven by eval results, not guesswork, and can show before/after numbers — **change made (planner prompt v2); the "after" run is still open.** The cheapest informative run is `EVAL_AGENTS=planner EVAL_LAYOUTS=diagonal,hard HIDE_TRAP=1 EVAL_RUNS=3 npm run eval` with and without `PLANNER_PROMPT=v1` (watch turns and $/run: v1 should show moves x 2 + 1 turns).
 
 **Explicitly out of scope:** full observability stack (Axiom/Better Stack) — that's real infra, not needed to learn the concept at toy scale. A JSON trace file + a console table is enough signal here.
 
@@ -212,6 +226,8 @@ HIDE_TRAP=1 EVAL_AGENTS=classic,claude pnpm eval       # trap only found by look
 - Cost covers both models (`costUsd` on the result), so `pnpm eval` compares like for like.
 
 Run the comparison with `EVAL_AGENTS=claude,planner pnpm eval` (add `HIDE_TRAP=1` for the case where a planner might help).
+
+**Observed (first real eval, above):** the planner cost about 2x a lone `claude` with no extra wins, and made the executor look before every move. That is why the planner prompt now has a `v2` (see Stage 5); whether `v2` actually helps is the open question.
 
 **Status:** the handoff was verified with a scripted stand-in client (strategy reaches the executor prompt, periodic and hazard checkpoints fire, planner tokens are billed at the planner's price). **No real-API scorecard yet**, so the "does it help?" question is open. My expectation, to be tested not assumed: on a 5x5 grid it costs more than a single agent for no gain, because the executor can already see the whole board. A planner earns its keep when the executor is much cheaper and the task is long enough that a strategy changes the outcome.
 
