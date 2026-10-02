@@ -6,3 +6,6 @@ node_modules/
 # but don't track the traces themselves.
 runs/*
 !runs/.gitkeep
+
+# Stage 4: local cross-run memory, not source.
+memory.json

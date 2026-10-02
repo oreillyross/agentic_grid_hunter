@@ -10,18 +10,20 @@
 agentic-grid-hunter/
   src/
     grid.ts          # environment: state, rules, rendering
-    agent.ts         # loop logic (grows per stage)
-    tools.ts          # tool defs + executors
-    memory.ts         # stage 4+
+    agent.ts         # Claude loop: plan -> tool call (grows per stage)
+    jev-agent.ts     # alternate brain: TypeSafe Jev classifier loop (see "Jev agent")
+    tools.ts          # tool defs + executors (shared by both agents)
+    memory.ts         # stage 4: per-run scratchpad + cross-run memory.json
     eval.ts            # stage 5+
-    cli.ts
+    cli.ts           # entry point: picks the agent (AGENT=jev|claude), writes the trace
   runs/                 # logged traces (gitignored except .gitkeep)
+  memory.json           # stage 4 long-term memory (gitignored, created on first run)
   README.md
 ```
 
 ---
 
-## Getting started (Stages 1–3 are built)
+## Getting started (Stages 1–4 are built)
 
 ```bash
 pnpm install
@@ -99,9 +101,32 @@ kicks it off.
 
 ---
 
-## Stage 4 — Memory
+## Stage 4 — Memory — built (Claude agent only)
 
 **Objective:** Distinguish short-term (within-run) from long-term (cross-run) memory, and see what each buys you.
+
+**What's built:**
+- **Hidden trap.** `HIDE_TRAP=1` keeps the trap out of the grid and the positions text the agent sees (`ViewOptions` in `grid.ts`). Without this there's nothing to remember: both agents were previously *told* where the trap is, so a second run could never beat a first. The agent can still find the trap with `look()` or by stepping on it.
+- **Short-term memory** (`memory.ts` `Scratchpad`): cells visited and hazards found this run, built from what the world reported (not from the model's claims) and rewritten into the system prompt before every API call.
+- **Long-term memory** (`memory.json`, gitignored): per-layout trap position and run history. Read at start, updated at the end, and told to the model as one line in the system prompt. The trap is learned from a `lose` or from a `look()` that sees it.
+- **`MEMORY=off`** skips reading and writing, for before/after comparisons.
+- Trace files now record `hideTrap` and `usedMemory`.
+
+```bash
+rm -f memory.json                                   # start with a blank memory
+HIDE_TRAP=1 LAYOUT=hard AGENT=claude npm start      # run 1: likely hits the trap, learns it
+HIDE_TRAP=1 LAYOUT=hard AGENT=claude npm start      # run 2: plan should cite the memory
+```
+
+**Scope limits:** only the Claude loop uses memory. `HIDE_TRAP=1` with `AGENT=jev` exits with an error, because Jev's state and trap guard read the real trap position.
+
+**Status:** plumbing verified offline with a scripted stand-in client (run 1 loses and writes `memory.json`; run 2's prompt contains the remembered trap and its stand-in detours and wins; no trap coordinates leak into the hidden-mode prompt). **Not yet checked against real Claude**: whether run 2's actual plan cites the memory, and whether it really does better, are the acceptance criteria below and still need a real run.
+
+**What it teaches:**
+- Memory is never a model feature, only text our code chooses to put in the prompt. Short-term and long-term differ in *lifetime*, not in mechanism.
+- Memory only helps for facts the agent can't already see. That is why the hidden trap exists.
+- Stale memory is a real risk: it's keyed by layout *name*, so if a layout's trap is edited, the agent is told something false. Real systems need invalidation.
+- A single remembered fact is easy. What to store, and when to forget, is the hard part once there is more than one fact.
 
 **Tasks:**
 - Short-term: a scratchpad string/array injected into every prompt this run — "cells explored," "known hazards this run" — built from the trace so far, no persistence needed
