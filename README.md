@@ -168,6 +168,57 @@ AGENT=claude pnpm start  # the Stage 3 Anthropic loop, unchanged
 
 ---
 
+## Claude vs Jev: what we've learned so far
+
+Everything below comes from a handful of hand-read runs on `LAYOUT=hard`, **not** from an eval. Treat it as hypotheses to test in Stage 5, not conclusions. No win rates exist yet.
+
+### What we observed
+
+| | Claude (`agent.ts`) | Jev (`jev-agent.ts`) |
+|---|---|---|
+| Output per turn | Free-text `<plan>` + one tool call | Probability per label for two `Choice` questions |
+| "Plan" in the trace | Real reasoning, written *before* the action | The probabilities, printed *after* the decision. Not reasoning |
+| Seen on `hard` | Plan named the trap at (4,2) and said it would `look` first | Run 1: walked into the trap without looking. Run 2 (after guards): got to (4,1), then spent every turn abstaining into `look()` until the turn cap |
+| Failure style | Not observed yet (too few runs) | Confident-wrong (run 1), then indecisive (run 2) |
+
+### Why they behave differently
+
+- **Claude reasons in tokens before it acts.** The `<plan>` is generated first, so the tool call is conditioned on it. "Trap is in my path" can change what comes next.
+- **Jev is one forward pass per question.** It classifies; it doesn't think step by step. `tool` and `direction` are two *independent* answers to the same state, so nothing forces them to agree. In run 2, `direction=right` stayed high (it points at the trap) while `tool` sat near 0.5 (torn between `move` and `look`).
+- **`look()` wasn't the missing piece.** It only reports the four neighbours, and the trap's position was already in Jev's state (`grid` and `positions`). So "why didn't it look first?" was the wrong question: looking adds no information the agent didn't have. The real failure was acting on a bad answer.
+- **A probability is not a correctness check.** The 0.60 abstain rule only catches *uncertainty*. Run 1 was confidently wrong, so the rule never fired. Run 2 was uncertain every turn, so the rule fired forever. Same rule, two opposite failures.
+- **Claude's plan is not proof of reasoning either.** A fluent plan can be a story written to match the action. Whether the plan *causes* good behaviour is something to measure, not assume. See the eval ideas below.
+
+### Learning points (agentic AI)
+
+1. **The loop is the same; the brain is swappable.** Both agents share `executeTool`, `TraceStep` and the grid. Only "decide the next action" changed. That's the whole shape of an agent: perceive, decide, act, feed back.
+2. **A generative model and a classifier want different harnesses.** Claude gets tools and history. Jev gets a typed question, and *you* supply the memory (`recent_history`) and the facts (`next_cell_by_direction`). Doing arithmetic for a one-shot classifier is part of the job.
+3. **Every fallback must change the state, or it's a loop.** `look()` is deterministic and free, so "abstain and look" repeats forever. Any "safe" action has to either add information or move the world forward. This is why the stall breaker exists.
+4. **Guard in code what must never happen.** Prompts and probabilities are soft. "Never step on the trap" is a hard rule, so it lives in `toAction`, not in the question wording.
+5. **Fixing one failure can expose the next.** The trap guard fixed run 1 and then run 2 appeared, because abstain was checked before the guard. The first fix was tested only against confident stub answers. Tests need to cover each *decision path*, not just the happy one.
+6. **Stubs prove plumbing, not quality.** The offline stubs showed the guard and stall breaker fire. They say nothing about how well real Jev plays. Don't read a stub win as a model win.
+7. **Make failures visible in the trace.** `STALLED` and `VETOED` in the `plan` field turn invisible code interventions into something you can count. If the guard does the real work, that should show up as a number.
+
+### Questions for Stage 5 (evals)
+
+Counting beats reading single runs. When `eval.ts` exists, record per run, per layout, per agent:
+
+- **Outcome:** win / trap hit / `move_limit`, plus moves-to-win. This is the ground truth.
+- **Trap-hit rate**, separate from the overall win rate.
+- **Abstain rate** (Jev): share of turns below the threshold.
+- **`VETOED` and `STALLED` counts** (Jev): how much the code guard is doing versus the model.
+- **Wasted turns:** turns that were `look()` or an edge bump.
+
+Experiments worth running once there's a harness (change one thing at a time):
+
+1. **Guard on vs off.** Does Jev win because of the model or because of the veto? Needs a flag to disable `toAction`'s veto.
+2. **`next_cell_by_direction` on vs off.** Did it help `direction`, or did it make `tool` more torn (run 2)?
+3. **Threshold sweep** (0.5 / 0.6 / 0.7 / 0.8). Plot abstain rate against win rate to see whether 0.60 earns its keep.
+4. **Claude with its plan vs without** (drop the `<plan>` requirement). Does writing a plan improve win rate, or just make it readable?
+5. **Same layout, N runs.** Claude and Jev both vary between runs; one trace says nothing about reliability.
+
+---
+
 ## Notes for execution
 
 - Each stage should be its own commit/PR, working end-to-end before moving on — same as Pantler slices
