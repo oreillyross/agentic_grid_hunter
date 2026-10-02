@@ -17,7 +17,17 @@
 // of earlier turns has to ride along inside `state` every call.
 
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
-import { type GridState, type Direction, renderGrid, describePositions, samePosition } from "./grid.js";
+import {
+  type GridState,
+  type Direction,
+  type Position,
+  DIRECTION_OFFSETS,
+  renderGrid,
+  describePositions,
+  samePosition,
+  inBounds,
+  cellAt,
+} from "./grid.js";
 import { executeTool } from "./tools.js";
 import type { RunResult, TraceStep } from "./agent.js";
 
@@ -61,6 +71,27 @@ export interface JevDecision {
   abstained: boolean;
 }
 
+const DIRECTIONS: Direction[] = ["up", "down", "left", "right"];
+
+function stepFrom(pos: Position, direction: Direction): Position {
+  const { dRow, dCol } = DIRECTION_OFFSETS[direction];
+  return { row: pos.row + dRow, col: pos.col + dCol };
+}
+
+/**
+ * What a move in each direction would land on. Precomputed so Jev's
+ * `direction` question is a lookup, not coordinate arithmetic it can get
+ * wrong in a single forward pass.
+ */
+function nextCellByDirection(state: GridState): Record<Direction, string> {
+  const result = {} as Record<Direction, string>;
+  for (const direction of DIRECTIONS) {
+    const next = stepFrom(state.player, direction);
+    result[direction] = inBounds(state, next) ? cellAt(state, next) : "edge";
+  }
+  return result;
+}
+
 /**
  * Builds the state object Jev judges. Everything Jev should reason about
  * must be here — it sees nothing else. `history` is the stand-in for the
@@ -72,6 +103,7 @@ function buildState(state: GridState, trace: TraceStep[], maxMoves: number, move
     grid: renderGrid(state),
     positions: describePositions(state),
     player_is_on_treasure: samePosition(state.player, state.treasure),
+    next_cell_by_direction: nextCellByDirection(state),
     moves_left: maxMoves - moveCount,
     recent_history: trace.slice(-HISTORY_WINDOW).map((step) => ({
       action: `${step.action.tool}(${JSON.stringify(step.action.input)})`,
@@ -111,12 +143,37 @@ export async function decide(
   };
 }
 
+/**
+ * Deterministic safety net: probabilities can't catch a confidently-wrong
+ * move, so code vetoes any step onto the trap. Picks the safe in-bounds
+ * direction that ends closest to the treasure (Manhattan distance).
+ */
+function safeDirectionInstead(state: GridState): Direction | null {
+  const distance = (p: Position) =>
+    Math.abs(p.row - state.treasure.row) + Math.abs(p.col - state.treasure.col);
+  const candidates = DIRECTIONS.map((direction) => ({ direction, next: stepFrom(state.player, direction) }))
+    .filter(({ next }) => inBounds(state, next) && !samePosition(next, state.trap))
+    .sort((a, b) => distance(a.next) - distance(b.next));
+  return candidates[0]?.direction ?? null;
+}
+
 /** Turns a decision into the (tool, input) pair `executeTool` understands. */
-function toAction(decision: JevDecision): { tool: string; input: unknown } {
+function toAction(
+  decision: JevDecision,
+  state: GridState
+): { tool: string; input: unknown; vetoed?: boolean } {
   if (decision.abstained) return { tool: "look", input: {} };
   switch (decision.tool.label) {
-    case "move":
+    case "move": {
+      const next = stepFrom(state.player, decision.direction.label);
+      if (inBounds(state, next) && samePosition(next, state.trap)) {
+        const safe = safeDirectionInstead(state);
+        return safe
+          ? { tool: "move", input: { direction: safe }, vetoed: true }
+          : { tool: "look", input: {}, vetoed: true };
+      }
       return { tool: "move", input: { direction: decision.direction.label } };
+    }
     case "pickup":
       return { tool: "pickup", input: { item: "treasure" } };
     default:
@@ -151,13 +208,15 @@ export async function runJevLoop(
 
   while (turn < turnCap) {
     const decision = await decide(client, state, trace, maxMoves, moveCount);
-    const action = toAction(decision);
+    const { vetoed, ...action } = toAction(decision, state);
 
     const { resultText, outcome } = executeTool(state, action.tool, action.input);
     if (action.tool === "move") moveCount++;
     turn++;
 
-    const plan = describeDecision(decision);
+    const plan = vetoed
+      ? `${describeDecision(decision)} -> VETOED: move would hit the trap, overridden by guard`
+      : describeDecision(decision);
     console.log(`[turn ${turn}, move ${moveCount}/${maxMoves}] jev: ${plan}`);
     console.log(`  ${action.tool}(${JSON.stringify(action.input)}) -> ${resultText}`);
     console.log(renderGrid(state));
