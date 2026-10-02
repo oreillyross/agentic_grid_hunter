@@ -160,6 +160,7 @@ AGENT=claude pnpm start  # the Stage 3 Anthropic loop, unchanged
 ```
 
 - **Abstain rule:** if the top label's probability is below `0.60` (`MIN_PROBABILITY`), the agent falls back to the free `look()` instead of acting. Illustrative threshold from TypeSafe's consistency cookbook; tune it with Stage 5 evals. Uses `probabilities`, not the `confidence` field.
+- **Trap guard:** probabilities can't catch a confidently-wrong move, so `toAction` vetoes any `move` onto the trap and redirects to the safe direction closest to the treasure (the trace `plan` says `VETOED`). `state.next_cell_by_direction` also hands Jev what each move would land on, so the `direction` question is a lookup rather than arithmetic.
 - **Stateless:** Jev keeps no conversation, so the last few turns ride along in `state` (`recent_history`) every call.
 - **Trace:** the `plan` field holds the decision's probabilities instead of prose.
 - **Known failure mode:** a run that abstains forever makes no moves; a turn cap (4x the move budget) ends it as `move_limit`.
