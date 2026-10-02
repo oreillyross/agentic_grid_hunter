@@ -23,11 +23,14 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { type GridState, type Position, renderGrid } from "./grid.js";
 import { TOOLS, executeTool } from "./tools.js";
 import { createScratchpad, renderScratchpad, updateScratchpad, type Scratchpad } from "./memory.js";
+import { addUsage, emptyUsage, fromApiUsage, type Usage } from "./usage.js";
 
 export interface RunResult {
   outcome: "win" | "lose" | "move_limit";
   moveCount: number;
   trace: TraceStep[];
+  /** Summed token usage over every API call this run (Claude loop only). */
+  usage?: Usage;
   /** A trap position the agent found this run (via look() or by hitting it), for long-term memory. */
   discoveredTrap?: Position;
 }
@@ -46,6 +49,8 @@ export interface TraceStep {
   outcome: "ok" | "win" | "lose";
   moveCount: number;
   gridAfter: string;
+  /** Tokens spent on the API call that produced this turn (Claude loop only). */
+  usage?: Usage;
 }
 
 const LEGEND_VISIBLE =
@@ -137,6 +142,7 @@ export async function runAgentLoop(
   const view = { hideTrap: options.hideTrap };
   // Short-term memory: lives and dies with this call.
   const scratchpad = createScratchpad(state);
+  const totalUsage = emptyUsage();
 
   // `messages` is the growing conversation history — every turn's request
   // and response gets appended, so the model always sees the full run so
@@ -162,6 +168,11 @@ export async function runAgentLoop(
       tools: TOOLS,
       messages,
     });
+
+    // Counted before anything else so even a text-only reply (which we
+    // re-ask below) is billed in the total — it cost real tokens.
+    const turnUsage = fromApiUsage(response.usage);
+    addUsage(totalUsage, turnUsage);
 
     // The assistant's full reply — including any text plus its tool_use
     // block(s) — goes back into history verbatim. The API requires this:
@@ -210,6 +221,7 @@ export async function runAgentLoop(
     const planText = plan ?? "(no plan given this turn)";
     console.log(`[turn ${turn}, move ${moveCount}/${maxMoves}] plan: ${planText}`);
     console.log(`  ${primary.name}(${JSON.stringify(primary.input)}) -> ${resultText}`);
+    console.log(`  tokens: ${turnUsage.inputTokens} in / ${turnUsage.outputTokens} out`);
     console.log(renderGrid(state));
     console.log();
 
@@ -221,6 +233,7 @@ export async function runAgentLoop(
       outcome,
       moveCount,
       gridAfter: renderGrid(state),
+      usage: turnUsage,
     });
 
     toolResultBlocks.push({ type: "tool_result", tool_use_id: primary.id, content: resultText });
@@ -247,8 +260,10 @@ export async function runAgentLoop(
     messages.push({ role: "user", content: toolResultBlocks });
 
     const discoveredTrap = scratchpad.hazards[0];
-    if (outcome === "win") return { outcome: "win", moveCount, trace, discoveredTrap };
-    if (outcome === "lose") return { outcome: "lose", moveCount, trace, discoveredTrap };
-    if (moveCount >= maxMoves) return { outcome: "move_limit", moveCount, trace, discoveredTrap };
+    if (outcome === "win") return { outcome: "win", moveCount, trace, discoveredTrap, usage: totalUsage };
+    if (outcome === "lose") return { outcome: "lose", moveCount, trace, discoveredTrap, usage: totalUsage };
+    if (moveCount >= maxMoves) {
+      return { outcome: "move_limit", moveCount, trace, discoveredTrap, usage: totalUsage };
+    }
   }
 }

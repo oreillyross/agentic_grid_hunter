@@ -19,6 +19,7 @@ import { TypeSafeClient } from "@typesafe-ai/sdk";
 import { runAgentLoop } from "./agent.js";
 import { runJevLoop } from "./jev-agent.js";
 import { loadLayoutMemory, recordRun, renderLongTerm } from "./memory.js";
+import { estimateCostUsd, formatCost } from "./usage.js";
 
 // Which brain drives the loop. "jev" (default) = TypeSafe Jev answering typed
 // Choice questions; "claude" = the Stage 3 plan-then-act Anthropic loop.
@@ -40,7 +41,7 @@ if (AGENT === "claude" && !process.env.ANTHROPIC_API_KEY) {
 const MODEL =
   AGENT === "jev"
     ? (process.env.TYPESAFE_DEFAULT_MODEL ?? "jev-latest")
-    : (process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5");
+    : (process.env.ANTHROPIC_MODEL ?? "claude-haiku-4-5");
 
 // The move-limit end condition from the README ("move limit reached, e.g.
 // 20 moves"). Only `move` tool calls count against this — `look` and
@@ -110,6 +111,15 @@ async function main() {
   console.log("=== Run complete ===");
   console.log(`Outcome: ${result.outcome}`);
   console.log(`Moves used: ${result.moveCount}/${MAX_MOVES}`);
+  const estimatedCostUsd = result.usage ? estimateCostUsd(MODEL, result.usage) : null;
+  if (result.usage) {
+    const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = result.usage;
+    console.log(
+      `Tokens: ${inputTokens} in / ${outputTokens} out` +
+        (cacheReadTokens + cacheWriteTokens > 0 ? ` (cache: ${cacheReadTokens} read, ${cacheWriteTokens} written)` : "")
+    );
+    console.log(`Estimated cost: ${formatCost(estimatedCostUsd)} (${MODEL}, list prices)`);
+  }
 
   if (useMemory) {
     recordRun(
@@ -126,7 +136,7 @@ async function main() {
     console.log(`Memory updated${result.discoveredTrap ? " (trap location learned)" : ""}.`);
   }
 
-  const runFile = writeTrace(startedAt, result, longTerm !== null);
+  const runFile = writeTrace(startedAt, result, longTerm !== null, estimatedCostUsd);
   console.log(`Trace written to ${runFile}`);
 }
 
@@ -140,7 +150,8 @@ async function main() {
 function writeTrace(
   startedAt: Date,
   result: Awaited<ReturnType<typeof runAgentLoop>>,
-  usedMemory: boolean
+  usedMemory: boolean,
+  estimatedCostUsd: number | null
 ): string {
   mkdirSync(RUNS_DIR, { recursive: true });
 
@@ -157,6 +168,8 @@ function writeTrace(
     usedMemory,
     outcome: result.outcome,
     moveCount: result.moveCount,
+    usage: result.usage ?? null,
+    estimatedCostUsd,
     trace: result.trace,
   };
 
