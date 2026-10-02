@@ -163,7 +163,8 @@ AGENT=claude pnpm start  # the Stage 3 Anthropic loop, unchanged
 - **Trap guard:** probabilities can't catch a confidently-wrong move, so `toAction` vetoes any `move` onto the trap and redirects to the safe direction closest to the treasure (the trace `plan` says `VETOED`). `state.next_cell_by_direction` also hands Jev what each move would land on, so the `direction` question is a lookup rather than arithmetic.
 - **Stateless:** Jev keeps no conversation, so the last few turns ride along in `state` (`recent_history`) every call.
 - **Trace:** the `plan` field holds the decision's probabilities instead of prose.
-- **Known failure mode:** a run that abstains forever makes no moves; a turn cap (4x the move budget) ends it as `move_limit`.
+- **Stall breaker:** `look()` is deterministic, so a second consecutive `look` (abstained or chosen) is replaced by a guarded move (or `pickup` on the treasure). The trace `plan` says `STALLED`. The guard also vetoes moves off the grid edge.
+- **Backstop:** a turn cap (4x the move budget) still ends a run as `move_limit`.
 
 ---
 

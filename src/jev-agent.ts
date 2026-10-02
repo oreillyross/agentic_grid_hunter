@@ -166,7 +166,7 @@ function toAction(
   switch (decision.tool.label) {
     case "move": {
       const next = stepFrom(state.player, decision.direction.label);
-      if (inBounds(state, next) && samePosition(next, state.trap)) {
+      if (!inBounds(state, next) || samePosition(next, state.trap)) {
         const safe = safeDirectionInstead(state);
         return safe
           ? { tool: "move", input: { direction: safe }, vetoed: true }
@@ -179,6 +179,12 @@ function toAction(
     default:
       return { tool: "look", input: {} };
   }
+}
+
+/** Overrides an abstain/look with the action that makes progress: pickup if on the treasure, else a move. */
+function forceAct(decision: JevDecision, state: GridState): JevDecision {
+  const label = samePosition(state.player, state.treasure) ? "pickup" : "move";
+  return { ...decision, tool: { ...decision.tool, label }, abstained: false };
 }
 
 /** One-line audit string for the trace; replaces Claude's `<plan>` text. */
@@ -208,15 +214,24 @@ export async function runJevLoop(
 
   while (turn < turnCap) {
     const decision = await decide(client, state, trace, maxMoves, moveCount);
-    const { vetoed, ...action } = toAction(decision, state);
+    let step = toAction(decision, state);
+
+    // `look` is deterministic: a second one in a row (abstained or chosen)
+    // returns the identical answer and changes nothing, so Jev would just
+    // repeat it until the turn cap. Break the loop with a guarded move.
+    const stalled = step.tool === "look" && trace[trace.length - 1]?.action.tool === "look";
+    if (stalled) step = toAction(forceAct(decision, state), state);
+
+    const { vetoed, ...action } = step;
 
     const { resultText, outcome } = executeTool(state, action.tool, action.input);
     if (action.tool === "move") moveCount++;
     turn++;
 
-    const plan = vetoed
-      ? `${describeDecision(decision)} -> VETOED: move would hit the trap, overridden by guard`
-      : describeDecision(decision);
+    const notes: string[] = [];
+    if (stalled) notes.push("STALLED: repeated look() adds no info, forcing a guarded move");
+    if (vetoed) notes.push("VETOED: move would hit the trap or the edge, overridden by guard");
+    const plan = [describeDecision(decision), ...notes].join(" -> ");
     console.log(`[turn ${turn}, move ${moveCount}/${maxMoves}] jev: ${plan}`);
     console.log(`  ${action.tool}(${JSON.stringify(action.input)}) -> ${resultText}`);
     console.log(renderGrid(state));
