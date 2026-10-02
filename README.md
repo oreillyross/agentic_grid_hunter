@@ -12,10 +12,14 @@ agentic-grid-hunter/
     grid.ts          # environment: state, rules, rendering
     agent.ts         # Claude loop: plan -> tool call (grows per stage)
     jev-agent.ts     # alternate brain: TypeSafe Jev classifier loop (see "Jev agent")
-    tools.ts          # tool defs + executors (shared by both agents)
+    tools.ts          # tool defs + executors (shared by all agents), incl. navigate_to
     memory.ts         # stage 4: per-run scratchpad + cross-run memory.json
-    eval.ts            # stage 5+
-    cli.ts           # entry point: picks the agent (AGENT=jev|claude), writes the trace
+    solver.ts         # BFS shortest path + walkTo: the classic, zero-token solution
+    classic-agent.ts  # AGENT=classic: no model, just solver.ts
+    planner-agent.ts  # stage 6: planner model steers an executor model
+    runners.ts        # builds any agent from a config string ("claude+nav")
+    eval.ts           # stage 5: scorecard over 10 layouts x N runs x agents
+    cli.ts            # entry point: plays one game, writes the trace
   runs/                 # logged traces (gitignored except .gitkeep)
   memory.json           # stage 4 long-term memory (gitignored, created on first run)
   README.md
@@ -23,7 +27,7 @@ agentic-grid-hunter/
 
 ---
 
-## Getting started (Stages 1–4 are built)
+## Getting started (Stages 1–6 and the classic solver are built)
 
 ```bash
 pnpm install
@@ -31,7 +35,17 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY
 pnpm start              # runs the agent loop: plan -> tool call -> result, per turn
 LAYOUT=hard pnpm start   # Stage 3's trap-in-the-way layout (see Stage 3 below)
 pnpm typecheck           # tsc --noEmit
+
+AGENT=classic pnpm start            # no model, no key, $0: BFS (see "The classic solution")
+AGENT=claude+nav pnpm start         # Claude, plus the navigate_to tool
+AGENT=planner pnpm start            # Stage 6: planner + executor
+pnpm eval                           # Stage 5 scorecard (classic only by default: free)
+EVAL_AGENTS=classic,claude,claude+nav,planner pnpm eval
 ```
+
+`LAYOUT` takes any of ten fixtures: `easy`, `adjacent`, `straight`, `diagonal`,
+`corridor`, `hard`, `trap_at_start`, `guarded_treasure`, `squeeze`, `big_7x7`
+(what each tests is in `src/grid.ts`).
 
 Every run also writes its full trace — plan text, action, tool result, and
 resulting state for each turn — to `runs/<timestamp>.json` (gitignored; see
@@ -160,36 +174,72 @@ A single Claude run once cost about 7 cents, which prompted this. Each Claude ru
 
 ---
 
-## Stage 5 — Evals & Observability
+## Stage 5 — Evals & Observability — harness built, before/after still to run
 
 **Objective:** This is where "production concerns" stops being abstract — you have ground truth (win/lose, move count) to score against.
 
-**Tasks:**
-- Fixed set of ~10 hand-designed layouts of varying difficulty, saved as fixtures
-- `eval.ts`: runs the agent N times (e.g. 5) per layout, records win rate and average moves-to-win
-- Output a simple table (layout, win rate, avg moves) — console table is fine, no dashboard needed
-- Pick one thing to tighten based on what the evals show (e.g. system prompt tweak) and re-run to confirm it moved the numbers
+**What's built:**
+- **Ten fixtures** in `LAYOUTS` (`grid.ts`), from "treasure is next to you" to a 7x7 board and a trap guarding the treasure. `LAYOUT=<name>` selects one for a single game.
+- **`eval.ts`** (`pnpm eval`): plays every layout x agent N times (`EVAL_RUNS`, default 5) on a fresh grid and prints two tables: wins/games and average moves per layout (next to the shortest possible, `opt`, computed by BFS), then per-agent totals: win %, trap-hit %, move-limit %, errors, moves per win, moves over optimal, turns, cost per run and **cost per win**.
+- **A spend brake.** `MAX_COST_USD` (default 2) stops the eval starting new games once the estimated spend passes it; an unattended loop over a paid API needs one. A real run is 10 layouts x 5 runs x agents, so check the arithmetic first: Haiku runs were roughly a cent each, Sonnet several times that.
+- Memory is **off** during evals so run 5 isn't graded against what run 1 learned. Results are saved to `runs/eval-<timestamp>.json`, so before/after is two files.
+- Agents are named by config strings (`runners.ts`): `classic`, `claude`, `claude+nav`, `planner`, `planner+nav`, `jev`. `HIDE_TRAP=1` turns on fog of war for all of them (Jev can't play it).
+
+```bash
+pnpm eval                                              # classic only: free, instant
+EVAL_AGENTS=classic,claude,planner EVAL_RUNS=3 pnpm eval
+HIDE_TRAP=1 EVAL_AGENTS=classic,claude pnpm eval       # trap only found by look()
+```
+
+**Status:** the harness runs end to end. `classic` scores 100% on all ten layouts at the optimal move count, $0. The Claude and planner paths were checked only with a scripted stand-in client (plumbing, accounting, handoff), **never against the real API**, so there are no Claude win rates in this repo yet. The second acceptance criterion, a change driven by eval numbers with before/after, needs your real runs: run the eval, pick the worst row (the "Questions for Stage 5" list below has candidate experiments), change one thing, re-run, and compare the two `runs/eval-*.json` files.
 
 **Acceptance criteria:**
-- Eval script runs unattended and produces a scorecard
-- You've made at least one change driven by eval results, not guesswork, and can show before/after numbers
+- Eval script runs unattended and produces a scorecard — **met** (`pnpm eval`).
+- You've made at least one change driven by eval results, not guesswork, and can show before/after numbers — **open, needs real API runs.**
 
 **Explicitly out of scope:** full observability stack (Axiom/Better Stack) — that's real infra, not needed to learn the concept at toy scale. A JSON trace file + a console table is enough signal here.
 
 ---
 
-## Stage 6 — Multi-Agent (planner / executor split)
+## Stage 6 — Multi-Agent (planner / executor split) — built, comparison still to run
 
 **Objective:** Only start this once 1–5 feel solid — this is the stage most tutorials rush into too early, and it's much clearer once you've felt the single-agent loop firsthand.
 
-**Tasks:**
-- Split into two roles: **planner** (sees full state + memory, produces a short strategy — not per-move, more like "head toward treasure, trap is likely near the walls") and **executor** (sees the strategy + immediate surroundings, picks the actual tool call)
-- Message-passing: planner's output becomes part of executor's system context; executor reports back after every N moves or on hazard encounter, planner can revise
-- Reuse the eval harness from stage 5 to compare single-agent vs. planner/executor on the same layouts
+**What's built** (`planner-agent.ts`, `AGENT=planner`):
+- **Planner** (`PLANNER_MODEL`, default `claude-sonnet-5-5`): one tool-less call that sees the grid, positions, long-term memory and move budget and writes a `<strategy>` of at most three sentences. Not per-move.
+- **Executor** (`ANTHROPIC_MODEL`, default Haiku): the existing `runAgentLoop`, with the strategy added to its system prompt. It still picks every tool call.
+- **Handoff contract.** Planner → executor: one strategy text, re-read before every executor API call, so a revision applies next turn. Executor → planner: an `ExecutorReport` (reason, turn, moves used, position, hazards found, last three turns), sent every 4 turns and immediately when a *new* hazard is found. The planner answers with a revised strategy or repeats it. Nothing else crosses: the planner never sees the executor's conversation, the executor never sees the planner's reasoning.
+- Cost covers both models (`costUsd` on the result), so `pnpm eval` compares like for like.
+
+Run the comparison with `EVAL_AGENTS=claude,planner pnpm eval` (add `HIDE_TRAP=1` for the case where a planner might help).
+
+**Status:** the handoff was verified with a scripted stand-in client (strategy reaches the executor prompt, periodic and hazard checkpoints fire, planner tokens are billed at the planner's price). **No real-API scorecard yet**, so the "does it help?" question is open. My expectation, to be tested not assumed: on a 5x5 grid it costs more than a single agent for no gain, because the executor can already see the whole board. A planner earns its keep when the executor is much cheaper and the task is long enough that a strategy changes the outcome.
 
 **Acceptance criteria:**
-- Two distinct prompts/roles with a defined handoff contract (what exactly planner passes to executor and vice versa)
-- Eval scorecard comparing single-agent (stage 3/4) vs. two-agent performance on the same 10 layouts
+- Two distinct prompts/roles with a defined handoff contract — **met** (above, and the header comment of `planner-agent.ts`).
+- Eval scorecard comparing single-agent vs two-agent on the same 10 layouts — **harness ready, needs your real run.**
+
+**Deviation from the original task text:** the executor still sees the whole grid, not only its immediate surroundings. The grid is its only source of its own position; restricting it would need a second state view.
+
+---
+
+## The classic solution (the final example: no model at all)
+
+A grid with a target is an implicit graph: cells are nodes, legal moves are edges. A few dozen lines of TypeScript (`src/solver.ts`) solve it deterministically, in microseconds, for $0, and never step on the trap. Run it: `AGENT=classic pnpm start`, or score it against the LLMs: `EVAL_AGENTS=classic,claude pnpm eval`.
+
+**Which search, when.** DFS (visited set + backtracking) is the right fit when the map is *unknown* and the agent must physically walk it, because it never strays far from where it already is. BFS finds shortest paths, but only over a map you already know, since an embodied agent can't teleport between frontier cells. The classic recipe is to explore with DFS, then BFS or A\* over what you discovered. In this game the treasure is always given and only the trap can be hidden, so there is nothing to explore: `walkTo` plans with BFS, looks at the neighbours before every step under fog of war (`HIDE_TRAP=1`), and re-plans around anything it finds. Move the treasure into fog too and you'd need the DFS phase.
+
+**What the LLM agents were doing, badly.** The scratchpad was a lossy visited set. The look before each move was neighbour expansion, billed at model prices. Every turn re-sent the whole history to re-derive what a queue and a hash set know.
+
+**The lesson that carries over.** If you can write the state as a type and the transition as a pure function, it belongs in code. An LLM earns its place when the input is unstructured, the goal is ambiguous, or the action space can't be enumerated in advance. Grid navigation is none of those.
+
+**In production the two combine:** the model decides *what* to do, deterministic tools do the *how*. That is `navigate_to(row, col)`: a tool that runs BFS internally, so the model names a destination instead of issuing single `move` calls. Turn it on with `NAVIGATE=1` or `AGENT=claude+nav`, then compare:
+
+```bash
+EVAL_AGENTS=classic,claude,claude+nav pnpm eval
+```
+
+Expected, not yet measured against real Claude: `claude` takes a dozen turns per game; `claude+nav` should take about two or three (navigate, then pickup), which cuts input tokens far more than prompt caching or prompt trimming would, because the cost is the turn count squared. `classic` is the same idea with the model removed entirely, and is the floor on cost and moves that any LLM agent must justify itself against.
 
 ---
 
@@ -214,7 +264,7 @@ AGENT=claude pnpm start  # the Stage 3 Anthropic loop, unchanged
 
 ## Claude vs Jev: what we've learned so far
 
-Everything below comes from a handful of hand-read runs on `LAYOUT=hard`, **not** from an eval. Treat it as hypotheses to test in Stage 5, not conclusions. No win rates exist yet.
+Everything below comes from a handful of hand-read runs on `LAYOUT=hard`, **not** from an eval. Treat it as hypotheses to test with `pnpm eval` (built, but not yet run against real Claude or Jev). No win rates exist yet.
 
 ### What we observed
 
@@ -245,7 +295,7 @@ Everything below comes from a handful of hand-read runs on `LAYOUT=hard`, **not*
 
 ### Questions for Stage 5 (evals)
 
-Counting beats reading single runs. When `eval.ts` exists, record per run, per layout, per agent:
+Counting beats reading single runs. `eval.ts` now records outcome, moves, turns and cost per run and layout; it does not yet record abstain rate or `VETOED`/`STALLED` counts for Jev. Per run, per layout, per agent:
 
 - **Outcome:** win / trap hit / `move_limit`, plus moves-to-win. This is the ground truth.
 - **Cost per run and cost per win** (from the `usage` / `estimatedCostUsd` trace fields). A cheaper model that wins less often can still be the better buy, so judge cost per *completed task*, not per run.

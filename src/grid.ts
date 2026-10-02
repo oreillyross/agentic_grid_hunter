@@ -55,18 +55,55 @@ export function samePosition(a: Position, b: Position): boolean {
   return a.row === b.row && a.col === b.col;
 }
 
-/** Which hand-placed layout to build — see `createGrid`. */
-export type Layout = "easy" | "hard";
+/**
+ * The fixed layout set (Stage 5's eval fixtures). Each is hand-placed and
+ * deterministic so a win rate means something: the same layout always poses
+ * the same problem. Players start where they are listed; `size` defaults to 5.
+ *
+ * What each one tests, roughly in order of difficulty for a naive agent:
+ *  - easy / adjacent / straight: trap is nowhere near the path.
+ *  - diagonal / corridor: trap near the middle, plenty of ways around it.
+ *  - hard: trap sits on the shortest straight-line path (Stage 3's layout).
+ *  - trap_at_start: trap touches the player, so the first moves matter.
+ *  - guarded_treasure: trap touches the treasure, one approach is fatal.
+ *  - squeeze: trap and treasure share a corner region.
+ *  - big_7x7: bigger board, more room to wander and run out of moves.
+ */
+export const LAYOUTS = {
+  easy: { player: [4, 0], treasure: [0, 4], trap: [2, 2] },
+  adjacent: { player: [2, 2], treasure: [2, 3], trap: [0, 0] },
+  straight: { player: [0, 0], treasure: [0, 4], trap: [4, 4] },
+  diagonal: { player: [0, 0], treasure: [4, 4], trap: [2, 2] },
+  corridor: { player: [2, 0], treasure: [2, 4], trap: [2, 2] },
+  hard: { player: [4, 0], treasure: [4, 4], trap: [4, 2] },
+  trap_at_start: { player: [4, 0], treasure: [0, 4], trap: [3, 0] },
+  guarded_treasure: { player: [4, 4], treasure: [0, 0], trap: [0, 1] },
+  squeeze: { player: [0, 0], treasure: [2, 2], trap: [1, 2] },
+  big_7x7: { player: [6, 0], treasure: [0, 6], trap: [3, 3], size: 7 },
+} as const satisfies Record<
+  string,
+  { player: readonly [number, number]; treasure: readonly [number, number]; trap: readonly [number, number]; size?: number }
+>;
+
+/** Which hand-placed layout to build — see `LAYOUTS` and `createGrid`. */
+export type Layout = keyof typeof LAYOUTS;
+
+export const LAYOUT_NAMES = Object.keys(LAYOUTS) as Layout[];
+
+export function isLayout(name: string): name is Layout {
+  return Object.hasOwn(LAYOUTS, name);
+}
+
+const toPosition = ([row, col]: readonly [number, number]): Position => ({ row, col });
 
 /**
- * Builds a hand-placed, fixed grid layout.
+ * Builds a fresh grid from a named fixture.
  *
  * Stage 1's acceptance criteria just needs "a grid" — no randomness, no
- * config. Hardcoding layouts here keeps things boring on purpose: the goal
- * is proving the round-trip (state -> text -> model -> text), not building a
- * level generator. A random/seeded generator is a natural thing to add once
- * Stage 5 needs a fixed set of eval fixtures — don't build it before you
- * need it.
+ * config. Hardcoding layouts keeps things boring on purpose: the goal is
+ * proving the round-trip (state -> text -> model -> text), not building a
+ * level generator. Stage 5 grew the table to ten fixtures so the eval harness
+ * has a fixed set to score against.
  *
  * "easy" (the Stage 2 default) keeps the trap off the direct path so a
  * naive agent can stumble into a win. "hard" is Stage 3's layout: the trap
@@ -75,20 +112,14 @@ export type Layout = "easy" | "hard";
  * straight line.
  */
 export function createGrid(layout: Layout = "easy"): GridState {
-  const size = 5;
-
-  if (layout === "hard") {
-    const player: Position = { row: 4, col: 0 }; // bottom-left corner
-    const treasure: Position = { row: 4, col: 4 }; // bottom-right corner
-    const trap: Position = { row: 4, col: 2 }; // dead center of the direct path
-    return { size, player, treasure, trap, treasureCollected: false };
-  }
-
-  const player: Position = { row: 4, col: 0 }; // bottom-left corner
-  const treasure: Position = { row: 0, col: 4 }; // top-right corner
-  const trap: Position = { row: 2, col: 2 }; // dead center
-
-  return { size, player, treasure, trap, treasureCollected: false };
+  const fixture: { player: readonly [number, number]; treasure: readonly [number, number]; trap: readonly [number, number]; size?: number } = LAYOUTS[layout];
+  return {
+    size: fixture.size ?? 5,
+    player: toPosition(fixture.player),
+    treasure: toPosition(fixture.treasure),
+    trap: toPosition(fixture.trap),
+    treasureCollected: false,
+  };
 }
 
 /**
